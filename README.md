@@ -3,6 +3,11 @@
 A small TCP proxy that keeps pointing at the current Redis master in a
 Sentinel-managed setup.
 
+> [!WARNING]
+> This project is in **alpha** status and not ready for production use. Its
+> main purpose is to access a Sentinel-managed Redis cluster from outside,
+> e.g. with [Redis Insight](https://redis.io/insight/).
+
 It asks a Redis Sentinel for the address of the master named `-master`,
 verifies that the resolved node actually reports `role:master` (Sentinel's
 view can be briefly stale during a failover), and forwards every TCP
@@ -22,6 +27,9 @@ or access to the pod network.
 
 - Continuous master resolution via Sentinel, with a `ROLE` check so traffic is
   never sent to a stale master during failover
+- On-demand re-resolve: when connecting to the master or a replica fails, the
+  proxy immediately refreshes the addresses via Sentinel and retries once,
+  instead of dropping the client until the next periodic resolve
 - Optional read-only endpoint (`-replica-listen`) that spreads client
   connections across all healthy replicas for read scaling
 - Sentinel authentication (`SENTINEL_PASSWORD` / `-password`)
@@ -64,7 +72,7 @@ YAML file passed with `-config FILE`. Precedence:
 
 | Flag | Environment variable | YAML key | Default | Meaning |
 | --- | --- | --- | --- | --- |
-| `-listen` | `RSP_LISTEN` | `listen` | `:9999` | Local address to accept client connections on |
+| `-listen` | `RSP_LISTEN` | `listen` | `:10000` | Local address of the master endpoint (empty with `-replica-listen` set = disabled, replica-only proxy) |
 | `-replica-listen` | `RSP_REPLICA_LISTEN` | `replica_listen` | — | Local address of the read-only endpoint that load-balances across replicas (empty = disabled) |
 | `-replica-fallback` | `RSP_REPLICA_FALLBACK` | `replica_fallback` | `master` | While no healthy replica is known: `master` proxies read connections to the master, `reject` refuses them |
 | `-sentinel` | `RSP_SENTINEL` | `sentinel` | `:26379` | Sentinel address |
@@ -73,7 +81,7 @@ YAML file passed with `-config FILE`. Precedence:
 | `-password` | `SENTINEL_PASSWORD` | `password` | — | Password for Sentinel; also used for the master-role probe unless `-master-password` is set |
 | `-master-username` | `RSP_MASTER_USERNAME` | `master_username` | — | ACL username for the master-role probe when it differs from Sentinel's (unset = use the Sentinel username) |
 | `-master-password` | `RSP_MASTER_PASSWORD` | `master_password` | — | Password for the master-role probe when the master's password differs from Sentinel's; set explicitly empty to probe without `AUTH` (Sentinel has a password, master doesn't) |
-| `-resolve-retries` | `RSP_RESOLVE_RETRIES` | `resolve_retries` | `3` | Consecutive retries of the initial master resolve |
+| `-resolve-retries` | `RSP_RESOLVE_RETRIES` | `resolve_retries` | `3` | Consecutive failures of the master resolve to tolerate (both at startup and in the continuous loop) before the proxy exits |
 | `-max-connections` | `RSP_MAX_CONNECTIONS` | `max_connections` | `100` | Cap on concurrently proxied client connections (0 = unlimited) |
 | `-idle-timeout` | `RSP_IDLE_TIMEOUT` | `idle_timeout` | `30s` | Close a connection after no traffic in either direction for this long (0 = never) |
 | `-debug` | `RSP_DEBUG` | `debug` | `false` | Per-connection debug logging (lifecycle and byte counts, not payloads) |
@@ -104,6 +112,10 @@ silently add load to the master.
 
 The replica endpoint uses the same client-facing TLS settings (`-listen-tls-*`)
 as the master endpoint.
+
+Setting `-replica-listen` while leaving `-listen` unset (or empty) disables
+the master endpoint entirely, turning the proxy into a read-only, replica-only
+endpoint.
 
 ### TLS to Sentinel
 

@@ -759,6 +759,61 @@ func TestResolverReflectsMasterChange(t *testing.T) {
 	}
 }
 
+// TestRefreshAddresses covers the out-of-band resolve the proxy triggers
+// after a failed backend connection: a refresh picks up a failover
+// immediately (without waiting for the update loop's next tick), while a
+// second refresh within the throttle window is a no-op.
+func TestRefreshAddresses(t *testing.T) {
+	backendA := startAcceptingListener(t)
+	backendB := startAcceptingListener(t)
+	addrA := backendA.Addr().(*net.TCPAddr)
+	addrB := backendB.Addr().(*net.TCPAddr)
+
+	var currentPort atomic.Int32
+	currentPort.Store(int32(addrA.Port))
+
+	sentinelListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("could not start mock sentinel: %v", err)
+	}
+	defer sentinelListener.Close()
+	go serveSwitchableSentinel(sentinelListener, &currentPort)
+
+	r := newResolver(t, sentinelListener.Addr().String(), testMasterName, 0)
+	ctx := context.Background()
+
+	// Before the initial resolve has completed there is nothing to refresh;
+	// the call must return immediately instead of blocking.
+	r.RefreshAddresses(ctx)
+
+	if err := r.InitialResolve(ctx); err != nil {
+		t.Fatalf("InitialResolve() error = %v", err)
+	}
+
+	wantA := (&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: addrA.Port}).String()
+	wantB := (&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: addrB.Port}).String()
+
+	if got := r.MasterAddress(); got != wantA {
+		t.Fatalf("MasterAddress() = %q, want %q", got, wantA)
+	}
+
+	// Simulate a sentinel failover: it now reports backend B as the master.
+	// The refresh must pick it up synchronously.
+	currentPort.Store(int32(addrB.Port))
+	r.RefreshAddresses(ctx)
+	if got := r.MasterAddress(); got != wantB {
+		t.Fatalf("MasterAddress() after refresh = %q, want %q", got, wantB)
+	}
+
+	// A second refresh right away falls into the throttle window and must
+	// not resolve again, even though sentinel's answer has changed back.
+	currentPort.Store(int32(addrA.Port))
+	r.RefreshAddresses(ctx)
+	if got := r.MasterAddress(); got != wantB {
+		t.Fatalf("MasterAddress() after throttled refresh = %q, want %q (unchanged)", got, wantB)
+	}
+}
+
 // TestResolverWaitsForSentinelStartup covers the sentinel startup phase:
 // right after a restart, sentinel monitors a 0.0.0.0 (or ::) placeholder
 // until it's reconfigured with the real master. The resolver must treat this

@@ -28,6 +28,15 @@ type replicaResolver interface {
 	ReplicaAddress() (addr string, ok bool)
 }
 
+// addressRefresher is optionally implemented by the resolver. When available,
+// the proxy uses it after a failed backend pick or dial to force an immediate
+// re-resolve of the master and replica addresses and retries once with the
+// fresh state, instead of dropping the client and waiting for the resolver's
+// periodic update loop to notice the failover.
+type addressRefresher interface {
+	RefreshAddresses(ctx context.Context)
+}
+
 // handshakeTimeout bounds the client's TLS handshake so a client that
 // connects and stalls cannot hold a goroutine indefinitely.
 const handshakeTimeout = 10 * time.Second
@@ -41,6 +50,7 @@ type RedisSentinelProxy struct {
 	sem            chan struct{} // connection-limit semaphore; nil = unlimited, shared by both listeners
 	debug          bool
 	masterResolver masterResolver
+	refresher      addressRefresher // nil when the resolver can't refresh on demand
 
 	// Replica endpoint; replicaAddr == nil means disabled.
 	replicaAddr           *net.TCPAddr
@@ -62,6 +72,7 @@ func NewRedisSentinelProxy(cfg *config.Config, mResolver masterResolver) (*Redis
 		debug:          *cfg.Debug,
 		masterResolver: mResolver,
 	}
+	p.refresher, _ = mResolver.(addressRefresher)
 
 	var err error
 	if cfg.Listen != nil && *cfg.Listen != "" {
@@ -193,12 +204,41 @@ func (r *RedisSentinelProxy) runListenLoop(ctx context.Context, listener net.Lis
 					<-r.sem
 				}
 			}()
-			r.proxy(conn, pick)
+			r.proxy(ctx, conn, pick)
 		}()
 	}
 }
 
-func (r *RedisSentinelProxy) proxy(incoming net.Conn, pick pickBackend) {
+// pickAndDial picks a backend for the connection and dials it.
+func (r *RedisSentinelProxy) pickAndDial(pick pickBackend) (net.Conn, string, string, error) {
+	addr, label, err := pick()
+	if err != nil {
+		return nil, "", "", err
+	}
+	remote, err := r.dialRedis(addr)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("error connecting to %s %s: %w", label, addr, err)
+	}
+	return remote, addr, label, nil
+}
+
+// connectBackend picks a backend and dials it. When the first attempt fails
+// (a stale master address after a failover, an unreachable replica, or no
+// healthy replica known), it asks the resolver to re-resolve the master and
+// replica addresses right away and retries once with the fresh state before
+// giving up on the client connection.
+func (r *RedisSentinelProxy) connectBackend(ctx context.Context, pick pickBackend) (net.Conn, string, string, error) {
+	remote, addr, label, err := r.pickAndDial(pick)
+	if err == nil || r.refresher == nil {
+		return remote, addr, label, err
+	}
+
+	log.Printf("%s; refreshing master and replica addresses and retrying", err)
+	r.refresher.RefreshAddresses(ctx)
+	return r.pickAndDial(pick)
+}
+
+func (r *RedisSentinelProxy) proxy(ctx context.Context, incoming net.Conn, pick pickBackend) {
 	defer incoming.Close()
 
 	// Complete the client's TLS handshake (including client-certificate
@@ -215,14 +255,9 @@ func (r *RedisSentinelProxy) proxy(incoming net.Conn, pick pickBackend) {
 		}
 	}
 
-	backendAddr, label, err := pick()
+	remote, backendAddr, label, err := r.connectBackend(ctx, pick)
 	if err != nil {
 		log.Printf("Rejecting connection from %s: %s", incoming.RemoteAddr(), err)
-		return
-	}
-	remote, err := r.dialRedis(backendAddr)
-	if err != nil {
-		log.Printf("Error connecting to %s: %s", label, err)
 		return
 	}
 	defer remote.Close()

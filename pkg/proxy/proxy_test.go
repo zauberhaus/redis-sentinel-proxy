@@ -55,6 +55,12 @@ const (
 	fallbackListenPort   = 12735
 	rejectProxyPort      = 12736
 	rejectListenPort     = 12737
+	refreshProxyPort     = 12738
+	refreshDeadPort      = 12739
+	refreshBackendPort   = 12740
+	refreshReplicaProxy  = 12741
+	refreshReplicaListen = 12742
+	refreshReplicaPort   = 12743
 )
 
 type stubResolver struct{ addr string }
@@ -72,6 +78,41 @@ func (r *atomicResolver) MasterAddress() string { return *r.addr.Load() }
 func (r *atomicResolver) setAddr(addr string) { r.addr.Store(&addr) }
 
 func ptr[T any](v T) *T { return &v }
+
+// refreshingResolver is a masterResolver whose cached address stays stale
+// until RefreshAddresses is called, simulating the on-demand re-resolve the
+// proxy triggers when connecting to the backend fails.
+type refreshingResolver struct {
+	atomicResolver
+	fresh     string
+	refreshes atomic.Int32
+}
+
+func (r *refreshingResolver) RefreshAddresses(context.Context) {
+	r.refreshes.Add(1)
+	r.setAddr(r.fresh)
+}
+
+// refreshingReplicaResolver serves the replica endpoint with no known
+// replicas until RefreshAddresses populates the set.
+type refreshingReplicaResolver struct {
+	master  string
+	fresh   string
+	replica atomic.Pointer[string]
+}
+
+func (s *refreshingReplicaResolver) MasterAddress() string { return s.master }
+
+func (s *refreshingReplicaResolver) ReplicaAddress() (string, bool) {
+	if p := s.replica.Load(); p != nil {
+		return *p, true
+	}
+	return "", false
+}
+
+func (s *refreshingReplicaResolver) RefreshAddresses(context.Context) {
+	s.replica.Store(&s.fresh)
+}
 
 // stubReplicaResolver additionally implements ReplicaAddress with a simple
 // round-robin over a fixed replica list, mirroring the real resolver.
@@ -427,6 +468,61 @@ func TestProxyFollowsMasterChange(t *testing.T) {
 	afterSwitch.SetDeadline(time.Now().Add(2 * time.Second))
 	if label, err := bufio.NewReader(afterSwitch).ReadString('\n'); err != nil || label != "backend-b\n" {
 		t.Fatalf("label = %q, err = %v, want backend-b", label, err)
+	}
+}
+
+// TestRefreshOnDialFailure verifies that when the resolver's cached master no
+// longer accepts connections (e.g. it just failed over), the proxy asks the
+// resolver for an immediate re-resolve and retries once, so the very first
+// client connection after the failover still succeeds instead of being
+// dropped.
+func TestRefreshOnDialFailure(t *testing.T) {
+	deadAddr := fmt.Sprintf("127.0.0.1:%d", refreshDeadPort) // nothing listens here
+	liveAddr := fmt.Sprintf("127.0.0.1:%d", refreshBackendPort)
+	startLabeledBackend(t, liveAddr, "fresh-master")
+
+	resolver := &refreshingResolver{fresh: liveAddr}
+	resolver.setAddr(deadAddr)
+
+	rsp := newProxyWithResolver(t, refreshProxyPort, &config.Config{}, resolver)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go rsp.Run(ctx)
+	proxyAddr := fmt.Sprintf("127.0.0.1:%d", refreshProxyPort)
+	waitForListener(t, proxyAddr)
+
+	if got := readLabel(t, proxyAddr); got != "fresh-master" {
+		t.Errorf("connection reached %q, want fresh-master (via refresh retry)", got)
+	}
+	if n := resolver.refreshes.Load(); n < 1 {
+		t.Errorf("RefreshAddresses() called %d times, want at least once", n)
+	}
+}
+
+// TestRefreshOnMissingReplica verifies the pick-error path of the refresh
+// retry: the replica endpoint (in reject mode) has no healthy replica, the
+// forced re-resolve repopulates the set, and the retried pick reaches the
+// fresh replica instead of the connection being rejected.
+func TestRefreshOnMissingReplica(t *testing.T) {
+	masterAddr := fmt.Sprintf("127.0.0.1:%d", refreshReplicaProxy+100)
+	replicaAddr := fmt.Sprintf("127.0.0.1:%d", refreshReplicaPort)
+	startLabeledBackend(t, masterAddr, "master")
+	startLabeledBackend(t, replicaAddr, "fresh-replica")
+
+	resolver := &refreshingReplicaResolver{master: masterAddr, fresh: replicaAddr}
+	replicaListen := fmt.Sprintf("127.0.0.1:%d", refreshReplicaListen)
+	rsp := newProxyWithResolver(t, refreshReplicaProxy,
+		&config.Config{ReplicaListen: ptr(replicaListen), ReplicaFallback: ptr(config.ReplicaFallbackReject)}, resolver)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go rsp.Run(ctx)
+	waitForListener(t, fmt.Sprintf("127.0.0.1:%d", refreshReplicaProxy))
+	waitForListener(t, replicaListen)
+
+	if got := readLabel(t, replicaListen); got != "fresh-replica" {
+		t.Errorf("replica endpoint reached %q, want fresh-replica (via refresh retry)", got)
 	}
 }
 

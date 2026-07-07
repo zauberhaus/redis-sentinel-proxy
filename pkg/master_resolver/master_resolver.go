@@ -31,6 +31,11 @@ var errSentinelNotReady = errors.New("sentinel is not ready yet")
 // shorten it).
 var sentinelNotReadyBackoff = 10 * time.Second
 
+// refreshThrottle limits how often failed backend connections can force an
+// out-of-band re-resolve via RefreshAddresses; the periodic update loop
+// already re-resolves every second (a var so tests can shorten it).
+var refreshThrottle = time.Second
+
 type RedisMasterResolver struct {
 	masterName               string
 	sentinel                 *redis.SentinelClient
@@ -42,6 +47,11 @@ type RedisMasterResolver struct {
 
 	masterAddrLock           *sync.RWMutex
 	initialMasterResolveLock chan struct{}
+
+	// refreshLock serializes out-of-band resolves triggered by the proxy via
+	// RefreshAddresses; lastRefresh (guarded by it) throttles them.
+	refreshLock sync.Mutex
+	lastRefresh time.Time
 
 	masterAddr   string
 	replicaAddrs []string
@@ -143,6 +153,30 @@ func (r *RedisMasterResolver) setReplicaAddresses(replicaAddrs []string) {
 		log.Printf("Healthy replicas: %v", replicaAddrs)
 	}
 	r.replicaAddrs = replicaAddrs
+}
+
+// RefreshAddresses forces an immediate re-resolve of the master and replica
+// addresses. The proxy calls it after failing to reach a backend, so a
+// failover is picked up right away instead of waiting for the next tick of
+// the update loop. Concurrent calls are serialized and throttled to
+// refreshThrottle, so a burst of failing client connections results in a
+// single resolve; failures are logged by the resolve path and never count
+// against the update loop's retry budget.
+func (r *RedisMasterResolver) RefreshAddresses(ctx context.Context) {
+	select {
+	case <-r.initialMasterResolveLock:
+	default:
+		// The initial resolve is still running; nothing to refresh yet.
+		return
+	}
+
+	r.refreshLock.Lock()
+	defer r.refreshLock.Unlock()
+	if time.Since(r.lastRefresh) < refreshThrottle {
+		return
+	}
+	r.lastRefresh = time.Now()
+	_ = r.updateMasterAddress(ctx) // it logs its own errors
 }
 
 func (r *RedisMasterResolver) updateMasterAddress(ctx context.Context) error {
