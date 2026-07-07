@@ -778,6 +778,22 @@ func TestResolverWaitsForSentinelStartup(t *testing.T) {
 	}
 }
 
+// isCommand reports whether cmd is the given command with the given number
+// of arguments. Redis command names are case-insensitive (go-redis sends
+// them in lowercase).
+func isCommand(cmd []string, name string, args int) bool {
+	return len(cmd) == args+1 && strings.EqualFold(cmd[0], name)
+}
+
+// replyUnknownCommand answers an unrecognized command (e.g. the client
+// library's HELLO handshake) with an error reply, so the client falls back
+// to RESP2 and proceeds with the commands the mock actually understands.
+// It reports whether the connection is still usable.
+func replyUnknownCommand(c net.Conn, cmd []string) bool {
+	_, err := fmt.Fprintf(c, "-ERR unknown command %q\r\n", cmd[0])
+	return err == nil
+}
+
 // serveStartupSentinel answers get-master-addr-by-name with a placeholder
 // host until ready flips to true, then with the real backend address,
 // simulating a sentinel that's still in its startup phase.
@@ -795,7 +811,7 @@ func serveStartupSentinel(listener net.Listener, placeholderHost string, realPor
 				if err != nil {
 					return
 				}
-				if len(cmd) == 3 && cmd[0] == "SENTINEL" && cmd[1] == "get-master-addr-by-name" {
+				if isCommand(cmd, "SENTINEL", 2) && cmd[1] == "get-master-addr-by-name" {
 					host := placeholderHost
 					if ready.Load() {
 						host = "127.0.0.1"
@@ -805,7 +821,9 @@ func serveStartupSentinel(listener net.Listener, placeholderHost string, realPor
 					}
 					continue
 				}
-				return
+				if !replyUnknownCommand(c, cmd) {
+					return
+				}
 			}
 		}(conn)
 	}
@@ -837,13 +855,15 @@ func startAcceptingListener(t *testing.T) net.Listener {
 					if err != nil {
 						return
 					}
-					if len(cmd) == 1 && cmd[0] == "ROLE" {
+					if isCommand(cmd, "ROLE", 0) {
 						if _, err := c.Write([]byte(roleReply("master"))); err != nil {
 							return
 						}
 						continue
 					}
-					return
+					if !replyUnknownCommand(c, cmd) {
+						return
+					}
 				}
 			}(conn)
 		}
@@ -868,14 +888,16 @@ func serveSwitchableSentinel(listener net.Listener, port *atomic.Int32) {
 				if err != nil {
 					return
 				}
-				if len(cmd) == 3 && cmd[0] == "SENTINEL" && cmd[1] == "get-master-addr-by-name" {
+				if isCommand(cmd, "SENTINEL", 2) && cmd[1] == "get-master-addr-by-name" {
 					reply := respAddress("127.0.0.1", int(port.Load()))
 					if _, err := c.Write([]byte(reply)); err != nil {
 						return
 					}
 					continue
 				}
-				return
+				if !replyUnknownCommand(c, cmd) {
+					return
+				}
 			}
 		}(conn)
 	}
@@ -938,13 +960,18 @@ func serveDemotedMasterConn(listener net.Listener) {
 				if err != nil {
 					return
 				}
-				if len(cmd) == 1 && cmd[0] == "ROLE" {
+				if len(cmd) == 1 && strings.EqualFold(cmd[0], "ROLE") {
 					if _, err := c.Write([]byte(roleReply("slave"))); err != nil {
 						return
 					}
 					continue
 				}
-				return
+				// Unknown commands (e.g. the client library's HELLO
+				// handshake) get an error reply so the client falls back
+				// to RESP2 and proceeds with ROLE.
+				if _, err := fmt.Fprintf(c, "-ERR unknown command %q\r\n", cmd[0]); err != nil {
+					return
+				}
 			}
 		}(conn)
 	}
@@ -1045,6 +1072,15 @@ func mockReadCommand(r *bufio.Reader) ([]string, error) {
 // tells the caller to close the connection instead of (or after) writing a
 // reply, simulating the sentinel dropping the connection mid-protocol.
 func buildMockReply(cmd []string) (reply string, closeAfter bool) {
+	// Redis commands are case-insensitive and go-redis sends them in
+	// lowercase; the well-known master names in the SENTINEL argument stay
+	// case-sensitive like real master group names.
+	cmd = slices.Clone(cmd)
+	cmd[0] = strings.ToUpper(cmd[0])
+	if len(cmd) > 1 && cmd[0] == "SENTINEL" {
+		cmd[1] = strings.ToLower(cmd[1])
+	}
+
 	switch {
 	case len(cmd) == 1 && cmd[0] == "ROLE":
 		reply = roleReply("master")

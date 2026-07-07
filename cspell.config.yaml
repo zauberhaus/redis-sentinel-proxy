@@ -26,6 +26,7 @@ words:
   - readelf
   - RESPOK
   - riscv
+  - SETINFO
   - tzdata
   - unmarshals
   - zauberhaus
