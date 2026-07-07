@@ -1,0 +1,4 @@
+/redis-sentinel-proxy
+/dist/
+.vscode
+.claude

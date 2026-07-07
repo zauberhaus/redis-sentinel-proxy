@@ -1,0 +1,31 @@
+version: "0.2"
+language: en
+ignorePaths:
+  - go.mod
+  - go.sum
+  - .gitignore
+  - "*.yaml"
+  - "*.json"
+words:
+  - armv
+  - armv6
+  - binutils
+  - buildx
+  - cacheonly
+  - Dockerfiles
+  - Enric
+  - extldflags
+  - failovers
+  - GOARCH
+  - GOARM
+  - laddr
+  - ldflags
+  - Lluelles
+  - masterresolver
+  - mymaster
+  - readelf
+  - RESPOK
+  - riscv
+  - tzdata
+  - zauberhaus
+  - zoneinfo
