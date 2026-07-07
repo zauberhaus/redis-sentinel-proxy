@@ -100,7 +100,7 @@ func NewRedisMasterResolver(cfg *config.Config) *RedisMasterResolver {
 		masterUsername:           masterUsername,
 		masterPassword:           masterPassword,
 		retryOnMasterResolveFail: *cfg.ResolveRetries,
-		trackReplicas:            *cfg.ReplicaListen != "",
+		trackReplicas:            cfg.ReplicaListen != nil && *cfg.ReplicaListen != "",
 		masterAddrLock:           &sync.RWMutex{},
 		initialMasterResolveLock: make(chan struct{}),
 	}

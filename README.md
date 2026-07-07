@@ -50,10 +50,10 @@ per-command read/write routing on a single endpoint is out of scope.
 ## Quick start
 
 ```
-./redis-sentinel-proxy -listen :9999 -sentinel sentinel.example.com:26379 -master mymaster
+./redis-sentinel-proxy -listen :6379 -sentinel sentinel.example.com:26379 -master mymaster
 ```
 
-Clients then connect to `:9999` as if it were the Redis master.
+Clients then connect to `:6379` as if it were the Redis master.
 
 ## Configuration
 

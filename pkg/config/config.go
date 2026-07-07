@@ -85,7 +85,7 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 // without nil checks.
 func Default() *Config {
 	return &Config{
-		Listen:          new(":9999"),
+		Listen:          new(""),
 		ReplicaListen:   new(""),
 		ReplicaFallback: new(ReplicaFallbackMaster),
 		Sentinel:        new(":26379"),
@@ -128,6 +128,14 @@ func (c *Config) String() string {
 
 	if c.Password != nil && *c.Password != "" {
 		cfg.Config.Password = new("*****")
+	}
+
+	if c.MasterPassword != nil && *c.MasterPassword != "" {
+		cfg.Config.MasterPassword = new("*****")
+	}
+
+	if c.Listen != nil && *c.Listen == "" {
+		cfg.Config.Listen = nil
 	}
 
 	if c.MasterPassword != nil && *c.MasterPassword != "" {
@@ -269,6 +277,15 @@ func Load(flagCfg *Config, path string) (*Config, error) {
 	cfg.tls.masterProbe, cfg.tls.master, err = cfg.masterTLSConfig()
 	if err != nil {
 		return nil, err
+	}
+
+	if (cfg.Listen == nil || *cfg.Listen == "") && (cfg.ReplicaListen == nil || *cfg.ReplicaListen == "") {
+		cfg.Listen = new(":10000")
+	}
+
+	if cfg.ReplicaListen != nil && *cfg.ReplicaListen == "" {
+		cfg.ReplicaListen = nil
+		cfg.ReplicaFallback = nil
 	}
 
 	return cfg, nil

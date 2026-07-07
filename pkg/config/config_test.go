@@ -102,7 +102,7 @@ master_tls:
 		cfg := writeAndLoad(t, `master_group: file-master`)
 
 		assertStr(t, "master", cfg.Master, "file-master")
-		assertStr(t, "listen", cfg.Listen, ":9999")
+		assertStr(t, "listen", cfg.Listen, ":10000")
 		assertBool(t, "sentinel_tls.enabled", cfg.SentinelTLS.Enabled, false)
 	})
 
@@ -116,7 +116,7 @@ master_tls:
 		if err != nil {
 			t.Fatalf("Load() error = %v", err)
 		}
-		assertStr(t, "listen", cfg.Listen, ":9999")
+		assertStr(t, "listen", cfg.Listen, ":10000")
 	})
 
 	t.Run("flags win over env, env over file, defaults fill the rest", func(t *testing.T) {

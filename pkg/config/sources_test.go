@@ -11,7 +11,7 @@ import (
 func TestDefault(t *testing.T) {
 	cfg := config.Default()
 
-	assertStr(t, "listen", cfg.Listen, ":9999")
+	assertStr(t, "listen", cfg.Listen, "")
 	assertStr(t, "sentinel", cfg.Sentinel, ":26379")
 	assertStr(t, "master", cfg.Master, "mymaster")
 	if cfg.Password != nil {

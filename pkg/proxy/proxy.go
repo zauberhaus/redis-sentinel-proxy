@@ -33,6 +33,7 @@ type replicaResolver interface {
 const handshakeTimeout = 10 * time.Second
 
 type RedisSentinelProxy struct {
+	// Master endpoint; localAddr == nil means disabled (replica-only proxy).
 	localAddr      *net.TCPAddr
 	tlsConf        *tls.Config
 	masterTLSConf  *tls.Config
@@ -48,18 +49,12 @@ type RedisSentinelProxy struct {
 }
 
 func NewRedisSentinelProxy(cfg *config.Config, mResolver masterResolver) (*RedisSentinelProxy, error) {
-	tcpAddr, err := net.ResolveTCPAddr("tcp", *cfg.Listen)
-	if err != nil {
-		return nil, fmt.Errorf("failed resolving listen address: %w", err)
-	}
-
 	var sem chan struct{}
 	if *cfg.MaxConnections > 0 {
 		sem = make(chan struct{}, *cfg.MaxConnections)
 	}
 
 	p := &RedisSentinelProxy{
-		localAddr:      tcpAddr,
 		tlsConf:        cfg.ListenTLSConfig(),
 		masterTLSConf:  cfg.MasterTLSConfig(),
 		idleTimeout:    time.Duration(*cfg.IdleTimeout),
@@ -68,7 +63,15 @@ func NewRedisSentinelProxy(cfg *config.Config, mResolver masterResolver) (*Redis
 		masterResolver: mResolver,
 	}
 
-	if *cfg.ReplicaListen != "" {
+	var err error
+	if cfg.Listen != nil && *cfg.Listen != "" {
+		p.localAddr, err = net.ResolveTCPAddr("tcp", *cfg.Listen)
+		if err != nil {
+			return nil, fmt.Errorf("failed resolving listen address: %w", err)
+		}
+	}
+
+	if cfg.ReplicaListen != nil && *cfg.ReplicaListen != "" {
 		p.replicaAddr, err = net.ResolveTCPAddr("tcp", *cfg.ReplicaListen)
 		if err != nil {
 			return nil, fmt.Errorf("failed resolving replica listen address: %w", err)
@@ -79,6 +82,10 @@ func NewRedisSentinelProxy(cfg *config.Config, mResolver masterResolver) (*Redis
 		}
 		p.replicaResolver = rResolver
 		p.replicaFallbackMaster = *cfg.ReplicaFallback == config.ReplicaFallbackMaster
+	}
+
+	if p.localAddr == nil && p.replicaAddr == nil {
+		return nil, fmt.Errorf("no endpoint configured: set listen and/or replica_listen")
 	}
 
 	return p, nil
@@ -102,39 +109,58 @@ func (r *RedisSentinelProxy) pickReplica() (string, string, error) {
 	return "", "", fmt.Errorf("no healthy replica available")
 }
 
-func (r *RedisSentinelProxy) Run(bigCtx context.Context) error {
-	var listener net.Listener
-	listener, err := net.ListenTCP("tcp", r.localAddr)
-	if err != nil {
-		return err
-	}
-	if r.tlsConf != nil {
-		listener = tls.NewListener(listener, r.tlsConf)
-	}
+func (r *RedisSentinelProxy) Run(ctx context.Context) (err error) {
+	var listeners []net.Listener
 
-	errGr, ctx := errgroup.WithContext(bigCtx)
-	errGr.Go(func() error { return r.runListenLoop(ctx, listener, r.pickMaster) })
-	errGr.Go(func() error { return closeListenerByContext(ctx, listener) })
+	defer func() {
+		if err != nil {
+			for _, l := range listeners {
+				l.Close()
+			}
+		}
+	}()
+
+	errGr, errCtx := errgroup.WithContext(ctx)
+
+	if r.localAddr != nil {
+		var masterListener net.Listener
+		masterListener, err = net.ListenTCP("tcp", r.localAddr)
+		if err != nil {
+			return err
+		}
+
+		if r.tlsConf != nil {
+			masterListener = tls.NewListener(masterListener, r.tlsConf)
+		}
+
+		listeners = append(listeners, masterListener)
+
+		errGr.Go(func() error { return r.runListenLoop(errCtx, masterListener, r.pickMaster, "master", r.localAddr) })
+		errGr.Go(func() error { return closeListenerByContext(errCtx, masterListener) })
+	}
 
 	if r.replicaAddr != nil {
 		var replicaListener net.Listener
 		replicaListener, err := net.ListenTCP("tcp", r.replicaAddr)
 		if err != nil {
-			listener.Close()
 			return err
 		}
+
 		if r.tlsConf != nil {
 			replicaListener = tls.NewListener(replicaListener, r.tlsConf)
 		}
-		errGr.Go(func() error { return r.runListenLoop(ctx, replicaListener, r.pickReplica) })
-		errGr.Go(func() error { return closeListenerByContext(ctx, replicaListener) })
+
+		listeners = append(listeners, replicaListener)
+
+		errGr.Go(func() error { return r.runListenLoop(errCtx, replicaListener, r.pickReplica, "replica", r.replicaAddr) })
+		errGr.Go(func() error { return closeListenerByContext(errCtx, replicaListener) })
 	}
 
 	return errGr.Wait()
 }
 
-func (r *RedisSentinelProxy) runListenLoop(ctx context.Context, listener net.Listener, pick pickBackend) error {
-	log.Println("Waiting for connections...")
+func (r *RedisSentinelProxy) runListenLoop(ctx context.Context, listener net.Listener, pick pickBackend, title string, addr *net.TCPAddr) error {
+	log.Printf("Waiting for %s connections on %v ...\n", title, addr)
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil

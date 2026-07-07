@@ -12,7 +12,7 @@ FROM scratch
 
 ENV TZ=Pacific/Auckland
 
-ENV RSP_LISTEN=":9999" \
+ENV RSP_LISTEN="" \
     RSP_SENTINEL=":26379" \
     RSP_MASTER="mymaster" \
     RSP_RESOLVE_RETRIES="3" \
