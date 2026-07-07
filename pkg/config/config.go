@@ -26,7 +26,9 @@ type Config struct {
 	ReplicaFallback *string     `yaml:"replica_fallback,omitempty"`
 	Sentinel        *string     `yaml:"sentinel,omitempty"`
 	Master          *string     `yaml:"master_group,omitempty"`
+	Username        *string     `yaml:"username,omitempty"`
 	Password        *string     `yaml:"password,omitempty"`
+	MasterUsername  *string     `yaml:"master_username,omitempty"`
 	MasterPassword  *string     `yaml:"master_password,omitempty"`
 	ResolveRetries  *int        `yaml:"resolve_retries,omitempty"`
 	MaxConnections  *int        `yaml:"max_connections,omitempty"`
@@ -161,7 +163,9 @@ func (c *Config) Merge(other *Config) {
 	fill(&c.ReplicaFallback, other.ReplicaFallback)
 	fill(&c.Sentinel, other.Sentinel)
 	fill(&c.Master, other.Master)
+	fill(&c.Username, other.Username)
 	fill(&c.Password, other.Password)
+	fill(&c.MasterUsername, other.MasterUsername)
 	fill(&c.MasterPassword, other.MasterPassword)
 	fill(&c.ResolveRetries, other.ResolveRetries)
 	fill(&c.MaxConnections, other.MaxConnections)

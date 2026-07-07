@@ -23,7 +23,9 @@ replica_listen: ":9998"
 replica_fallback: reject
 sentinel: "sentinel.example.com:26379"
 master_group: mymaster
+username: sentinel-user
 password: secret
+master_username: master-user
 master_password: master-secret
 resolve_retries: 5
 max_connections: 200
@@ -57,7 +59,9 @@ master_tls:
 		assertStr(t, "replica_fallback", cfg.ReplicaFallback, config.ReplicaFallbackReject)
 		assertStr(t, "sentinel", cfg.Sentinel, "sentinel.example.com:26379")
 		assertStr(t, "master", cfg.Master, "mymaster")
+		assertStr(t, "username", cfg.Username, "sentinel-user")
 		assertStr(t, "password", cfg.Password, "secret")
+		assertStr(t, "master_username", cfg.MasterUsername, "master-user")
 		assertStr(t, "master_password", cfg.MasterPassword, "master-secret")
 		if cfg.ResolveRetries == nil || *cfg.ResolveRetries != 5 {
 			t.Fatalf("resolve_retries = %v, want 5", cfg.ResolveRetries)

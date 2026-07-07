@@ -69,7 +69,9 @@ YAML file passed with `-config FILE`. Precedence:
 | `-replica-fallback` | `RSP_REPLICA_FALLBACK` | `replica_fallback` | `master` | While no healthy replica is known: `master` proxies read connections to the master, `reject` refuses them |
 | `-sentinel` | `RSP_SENTINEL` | `sentinel` | `:26379` | Sentinel address |
 | `-master` | `RSP_MASTER` | `master_group` | `mymaster` | Name of the master group to resolve |
+| `-username` | `SENTINEL_USERNAME` | `username` | — | ACL username for Sentinel; empty means authenticating with the password alone (`requirepass`) |
 | `-password` | `SENTINEL_PASSWORD` | `password` | — | Password for Sentinel; also used for the master-role probe unless `-master-password` is set |
+| `-master-username` | `RSP_MASTER_USERNAME` | `master_username` | — | ACL username for the master-role probe when it differs from Sentinel's (unset = use the Sentinel username) |
 | `-master-password` | `RSP_MASTER_PASSWORD` | `master_password` | — | Password for the master-role probe when the master's password differs from Sentinel's; set explicitly empty to probe without `AUTH` (Sentinel has a password, master doesn't) |
 | `-resolve-retries` | `RSP_RESOLVE_RETRIES` | `resolve_retries` | `3` | Consecutive retries of the initial master resolve |
 | `-max-connections` | `RSP_MAX_CONNECTIONS` | `max_connections` | `100` | Cap on concurrently proxied client connections (0 = unlimited) |

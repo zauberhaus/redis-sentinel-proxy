@@ -92,7 +92,9 @@ func TestFromEnv(t *testing.T) {
 		t.Setenv("RSP_LISTEN", "env-listen")
 		t.Setenv("RSP_REPLICA_LISTEN", "env-replica-listen")
 		t.Setenv("RSP_REPLICA_FALLBACK", "reject")
+		t.Setenv("SENTINEL_USERNAME", "env-username")
 		t.Setenv("SENTINEL_PASSWORD", "env-password")
+		t.Setenv("RSP_MASTER_USERNAME", "env-master-username")
 		t.Setenv("RSP_MASTER_PASSWORD", "env-master-password")
 		t.Setenv("RSP_RESOLVE_RETRIES", "5")
 		t.Setenv("RSP_MAX_CONNECTIONS", "100")
@@ -109,7 +111,9 @@ func TestFromEnv(t *testing.T) {
 		assertStr(t, "listen", cfg.Listen, "env-listen")
 		assertStr(t, "replica_listen", cfg.ReplicaListen, "env-replica-listen")
 		assertStr(t, "replica_fallback", cfg.ReplicaFallback, "reject")
+		assertStr(t, "username", cfg.Username, "env-username")
 		assertStr(t, "password", cfg.Password, "env-password")
+		assertStr(t, "master_username", cfg.MasterUsername, "env-master-username")
 		assertStr(t, "master_password", cfg.MasterPassword, "env-master-password")
 		if cfg.ResolveRetries == nil || *cfg.ResolveRetries != 5 {
 			t.Errorf("resolve_retries = %v, want 5", cfg.ResolveRetries)
@@ -159,12 +163,14 @@ func TestBindFlags(t *testing.T) {
 		fs := flag.NewFlagSet("test", flag.ContinueOnError)
 		fromFlags := config.BindFlags(fs)
 
-		if err := fs.Parse([]string{"-listen", "flag-listen", "-master-tls-ca-file", "flag-ca", "-sentinel-tls", "-max-connections", "50", "-idle-timeout", "2m", "-master-password", "flag-master-password"}); err != nil {
+		if err := fs.Parse([]string{"-listen", "flag-listen", "-master-tls-ca-file", "flag-ca", "-sentinel-tls", "-max-connections", "50", "-idle-timeout", "2m", "-username", "flag-username", "-master-password", "flag-master-password", "-master-username", "flag-master-username"}); err != nil {
 			t.Fatalf("Parse() error = %v", err)
 		}
 		cfg := fromFlags()
 
 		assertStr(t, "listen", cfg.Listen, "flag-listen")
+		assertStr(t, "username", cfg.Username, "flag-username")
+		assertStr(t, "master_username", cfg.MasterUsername, "flag-master-username")
 		assertStr(t, "master_password", cfg.MasterPassword, "flag-master-password")
 		assertStr(t, "master_tls.ca_file", cfg.MasterTLS.CAFile, "flag-ca")
 		assertBool(t, "sentinel_tls.enabled", cfg.SentinelTLS.Enabled, true)

@@ -48,8 +48,12 @@ func BindFlags(fs *flag.FlagSet) func() *Config {
 		func(c *Config, v *string) { c.Sentinel = v })
 	strFlag("master", *def.Master, "name of the master redis node",
 		func(c *Config, v *string) { c.Master = v })
+	strFlag("username", "", "ACL username for sentinel (empty: authenticate with the password alone, i.e. requirepass)",
+		func(c *Config, v *string) { c.Username = v })
 	strFlag("password", "", "redis password",
 		func(c *Config, v *string) { c.Password = v })
+	strFlag("master-username", "", "ACL username for the master-role probe when it differs from the sentinel username (unset: use the sentinel username)",
+		func(c *Config, v *string) { c.MasterUsername = v })
 	strFlag("master-password", "", "password for the master-role probe when it differs from the sentinel password (unset: use the sentinel password; explicitly empty: probe without AUTH)",
 		func(c *Config, v *string) { c.MasterPassword = v })
 	intFlag("resolve-retries", *def.ResolveRetries, "number of consecutive retries of the redis master node resolve",

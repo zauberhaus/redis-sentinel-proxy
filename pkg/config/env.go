@@ -21,7 +21,9 @@ func FromEnv() (*Config, error) {
 	strEnv(&c.ReplicaFallback, "RSP_REPLICA_FALLBACK")
 	strEnv(&c.Sentinel, "RSP_SENTINEL")
 	strEnv(&c.Master, "RSP_MASTER")
+	strEnv(&c.Username, "SENTINEL_USERNAME")
 	strEnv(&c.Password, "SENTINEL_PASSWORD")
+	strEnv(&c.MasterUsername, "RSP_MASTER_USERNAME")
 	strEnv(&c.MasterPassword, "RSP_MASTER_PASSWORD")
 	if err := intEnv(&c.ResolveRetries, "RSP_RESOLVE_RETRIES"); err != nil {
 		return nil, err

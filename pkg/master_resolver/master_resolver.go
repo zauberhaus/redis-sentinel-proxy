@@ -35,6 +35,7 @@ type RedisMasterResolver struct {
 	masterName               string
 	sentinel                 *redis.SentinelClient
 	masterTLSConf            *tls.Config
+	masterUsername           string
 	masterPassword           string
 	retryOnMasterResolveFail int
 	trackReplicas            bool
@@ -51,9 +52,10 @@ type RedisMasterResolver struct {
 // and the role probes: short per-operation timeouts (the resolve loop runs
 // every second), no client-side retries (the loops implement their own retry
 // policy), and no CLIENT SETINFO handshake chatter.
-func clientOptions(addr string, password string, tlsConf *tls.Config) *redis.Options {
+func clientOptions(addr string, username, password string, tlsConf *tls.Config) *redis.Options {
 	return &redis.Options{
 		Addr:            addr,
+		Username:        username,
 		Password:        password,
 		TLSConfig:       tlsConf,
 		DialTimeout:     time.Second,
@@ -69,14 +71,23 @@ func clientOptions(addr string, password string, tlsConf *tls.Config) *redis.Opt
 // configured in cfg. The sentinel connection is pooled and reused across
 // resolves; role probes open a short-lived connection to the resolved node.
 func NewRedisMasterResolver(cfg *config.Config) *RedisMasterResolver {
+	var username string
+	if cfg.Username != nil {
+		username = *cfg.Username
+	}
 	var password string
 	if cfg.Password != nil {
 		password = *cfg.Password
 	}
 
-	// The master-role probe reuses the sentinel password unless a dedicated
-	// master password is configured (an explicitly empty one disables AUTH on
-	// the probe).
+	// The master-role probe reuses the sentinel credentials unless dedicated
+	// master ones are configured (an explicitly empty master password
+	// disables AUTH on the probe; an empty username authenticates with the
+	// password alone, i.e. requirepass or the "default" ACL user).
+	masterUsername := username
+	if cfg.MasterUsername != nil {
+		masterUsername = *cfg.MasterUsername
+	}
 	masterPassword := password
 	if cfg.MasterPassword != nil {
 		masterPassword = *cfg.MasterPassword
@@ -84,8 +95,9 @@ func NewRedisMasterResolver(cfg *config.Config) *RedisMasterResolver {
 
 	return &RedisMasterResolver{
 		masterName:               *cfg.Master,
-		sentinel:                 redis.NewSentinelClient(clientOptions(*cfg.Sentinel, password, cfg.SentinelTLSConfig())),
+		sentinel:                 redis.NewSentinelClient(clientOptions(*cfg.Sentinel, username, password, cfg.SentinelTLSConfig())),
 		masterTLSConf:            cfg.MasterProbeTLSConfig(),
+		masterUsername:           masterUsername,
 		masterPassword:           masterPassword,
 		retryOnMasterResolveFail: *cfg.ResolveRetries,
 		trackReplicas:            *cfg.ReplicaListen != "",
@@ -327,7 +339,7 @@ func usableTCPAddr(host, port string) (*net.TCPAddr, error) {
 // password - they must match how the proxy itself dials the backend
 // (MasterTLS), otherwise a TLS-enabled backend resets the plaintext probe.
 func (r *RedisMasterResolver) checkRole(ctx context.Context, addr *net.TCPAddr, wantRole string) error {
-	client := redis.NewClient(clientOptions(addr.String(), r.masterPassword, r.masterTLSConf))
+	client := redis.NewClient(clientOptions(addr.String(), r.masterUsername, r.masterPassword, r.masterTLSConf))
 	defer client.Close()
 
 	reply, err := client.Do(ctx, "ROLE").Slice()

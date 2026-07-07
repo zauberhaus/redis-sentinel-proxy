@@ -24,10 +24,12 @@ words:
   - masterresolver
   - mymaster
   - readelf
+  - requirepass
   - RESPOK
   - riscv
   - SETINFO
   - tzdata
   - unmarshals
+  - WRONGPASS
   - zauberhaus
   - zoneinfo

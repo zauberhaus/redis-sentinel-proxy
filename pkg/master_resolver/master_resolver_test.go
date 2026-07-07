@@ -33,6 +33,7 @@ const (
 	testMasterName    = "test-master"
 	testPassword      = "sekret pass\r\nwith tricky chars"
 	testMasterPass    = "different master pass"
+	testUsername      = "acl-user"
 	mockServerPort    = 12700
 	unusedServerPort  = 12701
 	mockTLSServerPort = 12702
@@ -147,9 +148,12 @@ func TestResolveMasterAddress(t *testing.T) {
 		addr      string
 		tlsMode   string
 		masterTLS string
+		username  string
 		password  string
-		// masterPassword mirrors config.MasterPassword: nil falls back to
-		// password, an explicitly empty value disables AUTH on the role probe.
+		// masterUsername/masterPassword mirror the config fields: nil falls
+		// back to the sentinel credential, an explicitly empty master
+		// password disables AUTH on the role probe.
+		masterUsername *string
 		masterPassword *string
 		master         string
 		want           string
@@ -172,6 +176,31 @@ func TestResolveMasterAddress(t *testing.T) {
 			addr:     mockServerAddr.String(),
 			password: "wrong",
 			master:   testMasterName,
+		},
+		{
+			name:     "ACL username and password",
+			addr:     mockServerAddr.String(),
+			username: testUsername,
+			password: testPassword,
+			master:   testMasterName,
+			want:     mockServerAddr.String(),
+		},
+		{
+			name:     "wrong ACL username",
+			addr:     mockServerAddr.String(),
+			username: "wrong-user",
+			password: testPassword,
+			master:   testMasterName,
+		},
+		{
+			// Sentinel is open, but the master requires an ACL user: only
+			// the role probe must send the dedicated credentials.
+			name:           "ACL credentials for the master only",
+			addr:           mockServerAddr.String(),
+			masterUsername: ptr(testUsername),
+			masterPassword: ptr(testMasterPass),
+			master:         testMasterName,
+			want:           mockServerAddr.String(),
 		},
 		{
 			name:           "master password differs from sentinel password",
@@ -348,7 +377,8 @@ func TestResolveMasterAddress(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := resolveMaster(t, tt.addr, tt.tlsMode, tt.masterTLS, caFile, tt.password, tt.masterPassword, tt.master)
+			got := resolveMaster(t, tt.addr, tt.tlsMode, tt.masterTLS, caFile,
+				tt.username, tt.password, tt.masterUsername, tt.masterPassword, tt.master)
 			if got != tt.want {
 				t.Errorf("resolved master = %q, want %q", got, tt.want)
 			}
@@ -361,7 +391,7 @@ func TestResolveMasterAddress(t *testing.T) {
 // resolve attempt before returning on failure, or ticking indefinitely on
 // success) and returns whatever MasterAddress() unblocks with once that
 // initial attempt completes.
-func resolveMaster(t *testing.T, addr, tlsMode, masterTLSMode, caFile, password string, masterPassword *string, master string) string {
+func resolveMaster(t *testing.T, addr, tlsMode, masterTLSMode, caFile, username, password string, masterUsername, masterPassword *string, master string) string {
 	t.Helper()
 
 	sentinelTLS := &config.BackendTLS{Enabled: ptr(false)}
@@ -380,7 +410,9 @@ func resolveMaster(t *testing.T, addr, tlsMode, masterTLSMode, caFile, password 
 	cfg, err := config.Load(&config.Config{
 		Sentinel:       ptr(addr),
 		Master:         ptr(master),
+		Username:       ptr(username),
 		Password:       ptr(password),
+		MasterUsername: masterUsername,
 		MasterPassword: masterPassword,
 		ResolveRetries: ptr(0),
 		SentinelTLS:    sentinelTLS,
@@ -1092,6 +1124,12 @@ func buildMockReply(cmd []string) (reply string, closeAfter bool) {
 			closeAfter = true
 		default:
 			reply = "-ERR invalid password\r\n"
+		}
+	case len(cmd) == 3 && cmd[0] == "AUTH":
+		if cmd[1] == testUsername && (cmd[2] == testPassword || cmd[2] == testMasterPass) {
+			reply = "+OK\r\n"
+		} else {
+			reply = "-WRONGPASS invalid username-password pair\r\n"
 		}
 	case len(cmd) == 3 && cmd[0] == "SENTINEL" && cmd[1] == "replicas":
 		switch cmd[2] {
