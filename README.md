@@ -22,6 +22,8 @@ or access to the pod network.
 
 - Continuous master resolution via Sentinel, with a `ROLE` check so traffic is
   never sent to a stale master during failover
+- Optional read-only endpoint (`-replica-listen`) that spreads client
+  connections across all healthy replicas for read scaling
 - Sentinel authentication (`SENTINEL_PASSWORD` / `-password`)
 - TLS everywhere it matters: towards Sentinel, towards the master (originated
   or end-to-end pass-through), and terminated for clients — each with optional
@@ -32,13 +34,18 @@ or access to the pod network.
 
 ## Limitations
 
-The proxy forwards **all** traffic to the current master — replicas are never
-used, not even for reads. Through the proxy the Redis setup therefore behaves
-as active/passive: one node serves the entire load while the replicas exist
-only as failover standbys. Sentinel-aware clients that spread reads across
-replicas only work from inside the Kubernetes cluster, where the replica
-addresses are reachable — for outside clients going through the proxy, read
-scaling is not possible.
+The master endpoint forwards **all** its traffic to the current master, so
+with only that endpoint the Redis setup behaves as active/passive: one node
+serves the entire load while the replicas exist only as failover standbys.
+Enabling the read-only endpoint (`-replica-listen`) lifts this for reads: it
+load-balances connections across all healthy replicas, giving outside clients
+read scaling without any Sentinel awareness.
+
+The split is per **connection**, not per command: the proxy never inspects
+the proxied traffic, so applications must use two connection pools and keep
+writes on the master endpoint themselves (a write sent to the replica
+endpoint is rejected by Redis with a `READONLY` error). Transparent
+per-command read/write routing on a single endpoint is out of scope.
 
 ## Quick start
 
@@ -58,6 +65,8 @@ YAML file passed with `-config FILE`. Precedence:
 | Flag | Environment variable | YAML key | Default | Meaning |
 | --- | --- | --- | --- | --- |
 | `-listen` | `RSP_LISTEN` | `listen` | `:9999` | Local address to accept client connections on |
+| `-replica-listen` | `RSP_REPLICA_LISTEN` | `replica_listen` | — | Local address of the read-only endpoint that load-balances across replicas (empty = disabled) |
+| `-replica-fallback` | `RSP_REPLICA_FALLBACK` | `replica_fallback` | `master` | While no healthy replica is known: `master` proxies read connections to the master, `reject` refuses them |
 | `-sentinel` | `RSP_SENTINEL` | `sentinel` | `:26379` | Sentinel address |
 | `-master` | `RSP_MASTER` | `master_group` | `mymaster` | Name of the master group to resolve |
 | `-password` | `SENTINEL_PASSWORD` | `password` | — | Password for Sentinel; also used for the master-role probe unless `-master-password` is set |
@@ -73,6 +82,26 @@ Notes:
 - A connection with traffic in only one direction (e.g. a pub/sub subscriber)
   is not considered idle.
 - Further clients beyond `-max-connections` are rejected immediately.
+  The limit is shared between the master and replica endpoints.
+
+### Read-only replica endpoint
+
+With `-replica-listen` set, the proxy serves a second endpoint that
+load-balances client connections round-robin across all healthy replicas of
+the master group. Replicas are discovered via `SENTINEL replicas` (Redis 5+)
+alongside every master resolve; a replica counts as healthy when sentinel
+doesn't flag it down or disconnected, its replication link is up, and it
+answers a `ROLE` probe with `slave` (the probe uses the same TLS settings and
+password as the master probe). The choice is made per connection — an
+established connection stays on its replica.
+
+While no healthy replica is known, `-replica-fallback` decides what happens
+to new read connections: `master` (default) proxies them to the master, so
+the read endpoint never goes dark; `reject` refuses them, so readers can't
+silently add load to the master.
+
+The replica endpoint uses the same client-facing TLS settings (`-listen-tls-*`)
+as the master endpoint.
 
 ### TLS to Sentinel
 
@@ -133,6 +162,8 @@ Any option (the password included) can be set via YAML:
 
 ```yaml
 listen: ":9999"
+replica_listen: ":9998"
+replica_fallback: master
 sentinel: "sentinel.example.com:26379"
 master_group: mymaster
 password: secret

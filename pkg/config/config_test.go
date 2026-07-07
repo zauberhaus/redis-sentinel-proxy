@@ -19,6 +19,8 @@ func TestLoad(t *testing.T) {
 
 		cfg := writeAndLoad(t, fmt.Sprintf(`
 listen: ":9999"
+replica_listen: ":9998"
+replica_fallback: reject
 sentinel: "sentinel.example.com:26379"
 master_group: mymaster
 password: secret
@@ -51,6 +53,8 @@ master_tls:
 `, caFile, certFile, keyFile))
 
 		assertStr(t, "listen", cfg.Listen, ":9999")
+		assertStr(t, "replica_listen", cfg.ReplicaListen, ":9998")
+		assertStr(t, "replica_fallback", cfg.ReplicaFallback, config.ReplicaFallbackReject)
 		assertStr(t, "sentinel", cfg.Sentinel, "sentinel.example.com:26379")
 		assertStr(t, "master", cfg.Master, "mymaster")
 		assertStr(t, "password", cfg.Password, "secret")
@@ -146,6 +150,12 @@ master_tls:
 
 		if _, err := config.Load(nil, path); err == nil {
 			t.Fatal("expected error for invalid duration, got nil")
+		}
+	})
+
+	t.Run("invalid replica_fallback errors", func(t *testing.T) {
+		if _, err := config.Load(&config.Config{ReplicaFallback: new("bogus")}, ""); err == nil {
+			t.Fatal("expected error for invalid replica_fallback, got nil")
 		}
 	})
 

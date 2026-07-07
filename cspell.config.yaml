@@ -27,5 +27,6 @@ words:
   - RESPOK
   - riscv
   - tzdata
+  - unmarshals
   - zauberhaus
   - zoneinfo

@@ -10,9 +10,11 @@ import (
 	"io"
 	"log"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/zauberhaus/redis-sentinel-proxy/pkg/config"
@@ -22,6 +24,10 @@ import (
 // maxRESPBulkLen bounds bulk-string sizes we accept from sentinel, so a
 // misbehaving server can't make us allocate arbitrary amounts of memory.
 const maxRESPBulkLen = 4096
+
+// maxRESPArrayLen bounds array sizes we accept from sentinel (number of
+// replicas and number of fields per replica), for the same reason.
+const maxRESPArrayLen = 1024
 
 // errSentinelNotReady marks a resolve failure caused by sentinel reporting
 // the 0.0.0.0 (or ::) placeholder it monitors right after startup, before
@@ -44,11 +50,14 @@ type RedisMasterResolver struct {
 	sentinelPassword         string
 	masterPassword           string
 	retryOnMasterResolveFail int
+	trackReplicas            bool
 
 	masterAddrLock           *sync.RWMutex
 	initialMasterResolveLock chan struct{}
 
-	masterAddr string
+	masterAddr   string
+	replicaAddrs []string
+	replicaIdx   atomic.Uint64
 }
 
 // NewRedisMasterResolver creates a resolver that queries sentinel at
@@ -77,6 +86,7 @@ func NewRedisMasterResolver(cfg *config.Config) *RedisMasterResolver {
 		sentinelPassword:         password,
 		masterPassword:           masterPassword,
 		retryOnMasterResolveFail: *cfg.ResolveRetries,
+		trackReplicas:            *cfg.ReplicaListen != "",
 		masterAddrLock:           &sync.RWMutex{},
 		initialMasterResolveLock: make(chan struct{}),
 	}
@@ -96,6 +106,31 @@ func (r *RedisMasterResolver) setMasterAddress(masterAddr *net.TCPAddr) {
 	r.masterAddr = masterAddr.String()
 }
 
+// ReplicaAddress returns the address of a healthy replica, rotating through
+// the known set (round-robin per call). ok is false while no healthy replica
+// is known; the caller decides whether to fall back to the master or reject.
+// Like MasterAddress it blocks until the initial resolve has completed.
+func (r *RedisMasterResolver) ReplicaAddress() (addr string, ok bool) {
+	<-r.initialMasterResolveLock
+
+	r.masterAddrLock.RLock()
+	defer r.masterAddrLock.RUnlock()
+	if len(r.replicaAddrs) == 0 {
+		return "", false
+	}
+	idx := (r.replicaIdx.Add(1) - 1) % uint64(len(r.replicaAddrs))
+	return r.replicaAddrs[idx], true
+}
+
+func (r *RedisMasterResolver) setReplicaAddresses(replicaAddrs []string) {
+	r.masterAddrLock.Lock()
+	defer r.masterAddrLock.Unlock()
+	if !slices.Equal(r.replicaAddrs, replicaAddrs) {
+		log.Printf("Healthy replicas: %v", replicaAddrs)
+	}
+	r.replicaAddrs = replicaAddrs
+}
+
 func (r *RedisMasterResolver) updateMasterAddress() error {
 	masterAddr, err := redisMasterFromSentinelAddr(r.sentinelAddr, r.sentinelTLSConf, r.masterTLSConf, r.sentinelPassword, r.masterPassword, r.masterName)
 	if err != nil {
@@ -103,6 +138,18 @@ func (r *RedisMasterResolver) updateMasterAddress() error {
 		return err
 	}
 	r.setMasterAddress(masterAddr)
+
+	// Replica tracking is best-effort: a failure must not invalidate the
+	// successfully resolved master, so it doesn't count against the retry
+	// budget. The replica endpoint handles an empty set via its fallback.
+	if r.trackReplicas {
+		replicaAddrs, err := redisReplicasFromSentinelAddr(r.sentinelAddr, r.sentinelTLSConf, r.masterTLSConf, r.sentinelPassword, r.masterPassword, r.masterName)
+		if err != nil {
+			log.Printf("error resolving replicas: %s", err)
+			replicaAddrs = nil
+		}
+		r.setReplicaAddresses(replicaAddrs)
+	}
 	return nil
 }
 
@@ -178,28 +225,40 @@ func (r *RedisMasterResolver) initialMasterAddressResolve(ctx context.Context) e
 	return err
 }
 
-func redisMasterFromSentinelAddr(sentinelAddress string, sentinelTLSConf *tls.Config, masterTLSConf *tls.Config, sentinelPassword string, masterPassword string, masterName string) (*net.TCPAddr, error) {
+// dialSentinel opens an authenticated connection to sentinel with a 1-second
+// deadline. The caller must close the returned connection.
+func dialSentinel(sentinelAddress string, sentinelTLSConf *tls.Config, sentinelPassword string) (net.Conn, *bufio.Reader, error) {
 	conn, err := dialRESP(sentinelAddress, sentinelTLSConf)
 	if err != nil {
-		return nil, fmt.Errorf("error connecting to sentinel: %w", err)
+		return nil, nil, fmt.Errorf("error connecting to sentinel: %w", err)
 	}
-	defer conn.Close()
 
 	if err := conn.SetDeadline(time.Now().Add(time.Second)); err != nil {
-		return nil, fmt.Errorf("error setting deadline on sentinel connection: %w", err)
+		conn.Close()
+		return nil, nil, fmt.Errorf("error setting deadline on sentinel connection: %w", err)
 	}
 
 	reader := bufio.NewReader(conn)
 
-	// Authenticate with sentinel if password is provided
 	if sentinelPassword != "" {
 		if _, err := conn.Write(encodeRESPCommand("AUTH", sentinelPassword)); err != nil {
-			return nil, fmt.Errorf("error sending AUTH to sentinel: %w", err)
+			conn.Close()
+			return nil, nil, fmt.Errorf("error sending AUTH to sentinel: %w", err)
 		}
 		if err := readRESPOK(reader); err != nil {
-			return nil, fmt.Errorf("sentinel AUTH failed: %w", err)
+			conn.Close()
+			return nil, nil, fmt.Errorf("sentinel AUTH failed: %w", err)
 		}
 	}
+	return conn, reader, nil
+}
+
+func redisMasterFromSentinelAddr(sentinelAddress string, sentinelTLSConf *tls.Config, masterTLSConf *tls.Config, sentinelPassword string, masterPassword string, masterName string) (*net.TCPAddr, error) {
+	conn, reader, err := dialSentinel(sentinelAddress, sentinelTLSConf, sentinelPassword)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
 
 	// Request master address
 	if _, err := conn.Write(encodeRESPCommand("SENTINEL", "get-master-addr-by-name", masterName)); err != nil {
@@ -239,11 +298,125 @@ func redisMasterFromSentinelAddr(sentinelAddress string, sentinelTLSConf *tls.Co
 	// Check that the address sentinel gave us is actually a writable master,
 	// not e.g. a demoted former master that's still reachable but now a
 	// replica (sentinel's view can be briefly stale during a failover).
-	if err := checkMasterRole(addr, masterTLSConf, masterPassword); err != nil {
+	if err := checkRole(addr, masterTLSConf, masterPassword, "master"); err != nil {
 		return nil, fmt.Errorf("error checking redis master: %w", err)
 	}
 
 	return addr, nil
+}
+
+// redisReplicasFromSentinelAddr asks sentinel for the replicas of masterName
+// and returns the addresses of those that look usable: not flagged down or
+// disconnected by sentinel, with a working replication link, and actually
+// reporting role "slave" when probed (a replica mid-promotion reports
+// "master" and is skipped - it will be picked up as the master instead).
+// The result is sorted so callers can compare consecutive snapshots.
+func redisReplicasFromSentinelAddr(sentinelAddress string, sentinelTLSConf *tls.Config, masterTLSConf *tls.Config, sentinelPassword string, masterPassword string, masterName string) ([]string, error) {
+	conn, reader, err := dialSentinel(sentinelAddress, sentinelTLSConf, sentinelPassword)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write(encodeRESPCommand("SENTINEL", "replicas", masterName)); err != nil {
+		return nil, fmt.Errorf("error writing to sentinel: %w", err)
+	}
+
+	replicas, err := readRESPFieldMaps(reader)
+	if err != nil {
+		return nil, fmt.Errorf("error getting replicas from sentinel: %w", err)
+	}
+
+	var addrs []string
+	for _, fields := range replicas {
+		host, port := fields["ip"], fields["port"]
+		if host == "" || port == "" {
+			continue
+		}
+		if flags := fields["flags"]; strings.Contains(flags, "s_down") ||
+			strings.Contains(flags, "o_down") || strings.Contains(flags, "disconnected") {
+			continue
+		}
+		if link, ok := fields["master-link-status"]; ok && link != "ok" {
+			continue
+		}
+		if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+			continue
+		}
+		if portNum, err := strconv.Atoi(port); err != nil || portNum < 1 || portNum > 65535 {
+			continue
+		}
+
+		addr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(host, port))
+		if err != nil {
+			continue
+		}
+		if err := checkRole(addr, masterTLSConf, masterPassword, "slave"); err != nil {
+			continue
+		}
+		addrs = append(addrs, addr.String())
+	}
+	slices.Sort(addrs)
+	return addrs, nil
+}
+
+// readRESPFieldMaps reads a RESP array of arrays of bulk strings, where each
+// inner array is a flat field-name/value list (the shape of SENTINEL
+// replicas/masters/sentinels replies), and returns one map per inner array.
+func readRESPFieldMaps(r *bufio.Reader) ([]map[string]string, error) {
+	n, err := readRESPArrayHeader(r)
+	if err != nil {
+		return nil, err
+	}
+
+	maps := make([]map[string]string, 0, n)
+	for range n {
+		m, err := readRESPArrayHeader(r)
+		if err != nil {
+			return nil, err
+		}
+		if m%2 != 0 {
+			return nil, fmt.Errorf("expected an even number of field elements, got %d", m)
+		}
+
+		fields := make(map[string]string, m/2)
+		for range m / 2 {
+			key, err := readRESPBulkString(r)
+			if err != nil {
+				return nil, err
+			}
+			val, err := readRESPBulkString(r)
+			if err != nil {
+				return nil, err
+			}
+			fields[key] = val
+		}
+		maps = append(maps, fields)
+	}
+	return maps, nil
+}
+
+// readRESPArrayHeader reads a "*N" array header, rejecting error replies,
+// nil arrays and sizes beyond maxRESPArrayLen.
+func readRESPArrayHeader(r *bufio.Reader) (int, error) {
+	header, err := readRESPLine(r)
+	if err != nil {
+		return 0, err
+	}
+	switch {
+	case strings.HasPrefix(header, "-"):
+		return 0, fmt.Errorf("sentinel error: %q", header[1:])
+	case header == "*-1":
+		return 0, fmt.Errorf("sentinel returned nil reply")
+	case !strings.HasPrefix(header, "*"):
+		return 0, fmt.Errorf("unexpected reply: %q", header)
+	}
+
+	n, err := strconv.Atoi(header[1:])
+	if err != nil || n < 0 || n > maxRESPArrayLen {
+		return 0, fmt.Errorf("invalid array size: %q", header)
+	}
+	return n, nil
 }
 
 // encodeRESPCommand encodes a command as a RESP array of bulk strings. Unlike
@@ -343,13 +516,13 @@ func dialRESP(addr string, tlsConf *tls.Config) (net.Conn, error) {
 	return utils.TCPConnectWithTimeout(addr)
 }
 
-// checkMasterRole connects to addr and confirms it currently identifies as a
-// Redis master via the ROLE command, rejecting addresses that are reachable
-// but have been demoted to a replica (sentinel's view can be briefly stale
-// during a failover). A non-nil tlsConf makes the probe use TLS - it must
-// match how the proxy itself dials the master (MasterTLS), otherwise a
-// TLS-enabled master resets the plaintext probe.
-func checkMasterRole(addr *net.TCPAddr, tlsConf *tls.Config, password string) error {
+// checkRole connects to addr and confirms it currently identifies as
+// wantRole ("master" or "slave") via the ROLE command, rejecting addresses
+// whose actual role no longer matches sentinel's view (which can be briefly
+// stale during a failover). A non-nil tlsConf makes the probe use TLS - it
+// must match how the proxy itself dials the backend (MasterTLS), otherwise a
+// TLS-enabled backend resets the plaintext probe.
+func checkRole(addr *net.TCPAddr, tlsConf *tls.Config, password string, wantRole string) error {
 	conn, err := dialRESP(addr.String(), tlsConf)
 	if err != nil {
 		return err
@@ -371,14 +544,14 @@ func checkMasterRole(addr *net.TCPAddr, tlsConf *tls.Config, password string) er
 	}
 
 	if _, err := conn.Write(encodeRESPCommand("ROLE")); err != nil {
-		return fmt.Errorf("error sending ROLE to master: %w", err)
+		return fmt.Errorf("error sending ROLE: %w", err)
 	}
 	role, err := readRESPRoleReply(reader)
 	if err != nil {
-		return fmt.Errorf("error reading ROLE reply from master: %w", err)
+		return fmt.Errorf("error reading ROLE reply: %w", err)
 	}
-	if role != "master" {
-		return fmt.Errorf("resolved address is not a master (role=%q)", role)
+	if role != wantRole {
+		return fmt.Errorf("resolved address is not a %s (role=%q)", wantRole, role)
 	}
 	return nil
 }

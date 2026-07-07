@@ -40,6 +40,10 @@ func BindFlags(fs *flag.FlagSet) func() *Config {
 
 	strFlag("listen", *def.Listen, "local address",
 		func(c *Config, v *string) { c.Listen = v })
+	strFlag("replica-listen", *def.ReplicaListen, "local address of the read-only endpoint that load-balances across replicas (empty = disabled)",
+		func(c *Config, v *string) { c.ReplicaListen = v })
+	strFlag("replica-fallback", *def.ReplicaFallback, "what the replica endpoint does while no healthy replica is known: \"master\" proxies to the master, \"reject\" refuses the connection",
+		func(c *Config, v *string) { c.ReplicaFallback = v })
 	strFlag("sentinel", *def.Sentinel, "remote address",
 		func(c *Config, v *string) { c.Sentinel = v })
 	strFlag("master", *def.Master, "name of the master redis node",

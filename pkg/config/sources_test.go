@@ -90,6 +90,8 @@ func TestMerge(t *testing.T) {
 func TestFromEnv(t *testing.T) {
 	t.Run("only set variables are populated", func(t *testing.T) {
 		t.Setenv("RSP_LISTEN", "env-listen")
+		t.Setenv("RSP_REPLICA_LISTEN", "env-replica-listen")
+		t.Setenv("RSP_REPLICA_FALLBACK", "reject")
 		t.Setenv("SENTINEL_PASSWORD", "env-password")
 		t.Setenv("RSP_MASTER_PASSWORD", "env-master-password")
 		t.Setenv("RSP_RESOLVE_RETRIES", "5")
@@ -105,6 +107,8 @@ func TestFromEnv(t *testing.T) {
 		}
 
 		assertStr(t, "listen", cfg.Listen, "env-listen")
+		assertStr(t, "replica_listen", cfg.ReplicaListen, "env-replica-listen")
+		assertStr(t, "replica_fallback", cfg.ReplicaFallback, "reject")
 		assertStr(t, "password", cfg.Password, "env-password")
 		assertStr(t, "master_password", cfg.MasterPassword, "env-master-password")
 		if cfg.ResolveRetries == nil || *cfg.ResolveRetries != 5 {

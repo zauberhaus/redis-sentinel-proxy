@@ -18,6 +18,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -37,6 +38,7 @@ const (
 	mockTLSServerPort = 12702
 	demotedMasterPort = 12703
 	tlsMasterPort     = 12704
+	secondReplicaPort = 12705
 )
 
 // respBulkString encodes a single RESP bulk string, e.g. for the first
@@ -403,6 +405,99 @@ func resolveMaster(t *testing.T, addr, tlsMode, masterTLSMode, caFile, password 
 	case <-time.After(5 * time.Second):
 		t.Fatal("MasterAddress() did not return in time")
 		return ""
+	}
+}
+
+// TestResolveReplicas exercises replica tracking: the resolver must keep the
+// replicas that sentinel and the role probe agree are healthy, skip the ones
+// flagged down / with a broken link / actually reporting role "master", and
+// rotate through the healthy set on consecutive ReplicaAddress calls.
+func TestResolveReplicas(t *testing.T) {
+	mockServerAddr := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: mockServerPort}
+	listener, err := net.ListenTCP("tcp", mockServerAddr)
+	if err != nil {
+		t.Fatalf("could not start mock sentinel: %v", err)
+	}
+	defer listener.Close()
+	go mockSentinelServer(listener)
+
+	// Two healthy replicas answering ROLE with "slave".
+	var replicaAddrs []string
+	for _, port := range []int{demotedMasterPort, secondReplicaPort} {
+		addr := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port}
+		l, err := net.ListenTCP("tcp", addr)
+		if err != nil {
+			t.Fatalf("could not start mock replica: %v", err)
+		}
+		defer l.Close()
+		go serveDemotedMasterConn(l)
+		replicaAddrs = append(replicaAddrs, addr.String())
+	}
+
+	cfg, err := config.Load(&config.Config{
+		Sentinel:       ptr(mockServerAddr.String()),
+		Master:         ptr(testMasterName),
+		Password:       ptr(""),
+		ResolveRetries: ptr(0),
+		ReplicaListen:  ptr(":0"), // non-empty enables replica tracking
+	}, "")
+	if err != nil {
+		t.Fatalf("config.Load() error = %v", err)
+	}
+	r := masterresolver.NewRedisMasterResolver(cfg)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go r.UpdateMasterAddressLoop(ctx)
+
+	done := make(chan string, 1)
+	go func() { done <- r.MasterAddress() }()
+	select {
+	case got := <-done:
+		if got != mockServerAddr.String() {
+			t.Fatalf("MasterAddress() = %q, want %q", got, mockServerAddr.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("MasterAddress() did not return in time")
+	}
+
+	// Consecutive picks must rotate through both healthy replicas and
+	// nothing else.
+	first, ok := r.ReplicaAddress()
+	if !ok {
+		t.Fatal("ReplicaAddress() reported no healthy replica")
+	}
+	second, ok := r.ReplicaAddress()
+	if !ok {
+		t.Fatal("ReplicaAddress() reported no healthy replica on second call")
+	}
+	got := []string{first, second}
+	slices.Sort(got)
+	if !slices.Equal(got, replicaAddrs) {
+		t.Errorf("ReplicaAddress() rotation = %v, want %v", got, replicaAddrs)
+	}
+}
+
+// TestReplicaAddressWithoutTracking covers the disabled path: without a
+// replica listener the resolver never queries sentinel for replicas and
+// ReplicaAddress reports no replica.
+func TestReplicaAddressWithoutTracking(t *testing.T) {
+	mockServerAddr := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: mockServerPort}
+	listener, err := net.ListenTCP("tcp", mockServerAddr)
+	if err != nil {
+		t.Fatalf("could not start mock sentinel: %v", err)
+	}
+	defer listener.Close()
+	go mockSentinelServer(listener)
+
+	r := newResolver(t, mockServerAddr.String(), testMasterName, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go r.UpdateMasterAddressLoop(ctx)
+	r.MasterAddress()
+
+	if addr, ok := r.ReplicaAddress(); ok {
+		t.Errorf("ReplicaAddress() = %q, want none with tracking disabled", addr)
 	}
 }
 
@@ -962,6 +1057,24 @@ func buildMockReply(cmd []string) (reply string, closeAfter bool) {
 		default:
 			reply = "-ERR invalid password\r\n"
 		}
+	case len(cmd) == 3 && cmd[0] == "SENTINEL" && cmd[1] == "replicas":
+		switch cmd[2] {
+		case testMasterName:
+			reply = respReplicas(
+				// healthy: answers ROLE with "slave"
+				respFieldMap("ip", "127.0.0.1", "port", strconv.Itoa(demotedMasterPort), "flags", "slave"),
+				// healthy: second replica, link status explicitly ok
+				respFieldMap("ip", "127.0.0.1", "port", strconv.Itoa(secondReplicaPort), "flags", "slave", "master-link-status", "ok"),
+				// flagged subjectively down by sentinel: skipped without probing
+				respFieldMap("ip", "127.0.0.1", "port", strconv.Itoa(unusedServerPort), "flags", "slave,s_down"),
+				// broken replication link: skipped without probing
+				respFieldMap("ip", "127.0.0.1", "port", strconv.Itoa(unusedServerPort), "flags", "slave", "master-link-status", "err"),
+				// looks healthy to sentinel but reports ROLE "master": skipped by the probe
+				respFieldMap("ip", "127.0.0.1", "port", strconv.Itoa(mockServerPort), "flags", "slave"),
+			)
+		default:
+			reply = respReplicas()
+		}
 	case len(cmd) == 3 && cmd[0] == "SENTINEL" && cmd[1] == "get-master-addr-by-name":
 		switch cmd[2] {
 		case testMasterName:
@@ -1017,4 +1130,19 @@ func buildMockReply(cmd []string) (reply string, closeAfter bool) {
 func respAddress(host string, port int) string {
 	portStr := strconv.Itoa(port)
 	return fmt.Sprintf("*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(host), host, len(portStr), portStr)
+}
+
+// respFieldMap encodes a flat field-name/value list as a RESP array of bulk
+// strings, the shape of each element of a SENTINEL replicas reply.
+func respFieldMap(pairs ...string) string {
+	s := fmt.Sprintf("*%d\r\n", len(pairs))
+	for _, p := range pairs {
+		s += respBulkString(p)
+	}
+	return s
+}
+
+// respReplicas builds a SENTINEL replicas reply for the given field maps.
+func respReplicas(fieldMaps ...string) string {
+	return fmt.Sprintf("*%d\r\n", len(fieldMaps)) + strings.Join(fieldMaps, "")
 }

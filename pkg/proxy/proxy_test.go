@@ -19,6 +19,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -45,6 +46,15 @@ const (
 	failoverProxyPort    = 12726
 	debugProxyPort       = 12727
 	debugBackendPort     = 12728
+	replicaMasterBackend = 12729
+	replicaBackendAPort  = 12730
+	replicaBackendBPort  = 12731
+	replicaProxyPort     = 12732
+	replicaListenPort    = 12733
+	fallbackProxyPort    = 12734
+	fallbackListenPort   = 12735
+	rejectProxyPort      = 12736
+	rejectListenPort     = 12737
 )
 
 type stubResolver struct{ addr string }
@@ -62,6 +72,23 @@ func (r *atomicResolver) MasterAddress() string { return *r.addr.Load() }
 func (r *atomicResolver) setAddr(addr string) { r.addr.Store(&addr) }
 
 func ptr[T any](v T) *T { return &v }
+
+// stubReplicaResolver additionally implements ReplicaAddress with a simple
+// round-robin over a fixed replica list, mirroring the real resolver.
+type stubReplicaResolver struct {
+	master   string
+	replicas []string
+	idx      atomic.Uint64
+}
+
+func (s *stubReplicaResolver) MasterAddress() string { return s.master }
+
+func (s *stubReplicaResolver) ReplicaAddress() (string, bool) {
+	if len(s.replicas) == 0 {
+		return "", false
+	}
+	return s.replicas[(s.idx.Add(1)-1)%uint64(len(s.replicas))], true
+}
 
 // testCert is a self-signed certificate for 127.0.0.1, available both
 // in-memory (for test TLS servers/clients) and as PEM files (for the
@@ -403,6 +430,100 @@ func TestProxyFollowsMasterChange(t *testing.T) {
 	}
 }
 
+// readLabel dials addr and returns the first line the backend sends, so
+// tests can tell which labeled backend a connection was proxied to.
+func readLabel(t *testing.T, addr string) string {
+	t.Helper()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("could not connect to %s: %v", addr, err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	label, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		t.Fatalf("could not read label from %s: %v", addr, err)
+	}
+	return strings.TrimSuffix(label, "\n")
+}
+
+func TestReplicaEndpoint(t *testing.T) {
+	masterAddr := fmt.Sprintf("127.0.0.1:%d", replicaMasterBackend)
+	replicaA := fmt.Sprintf("127.0.0.1:%d", replicaBackendAPort)
+	replicaB := fmt.Sprintf("127.0.0.1:%d", replicaBackendBPort)
+	startLabeledBackend(t, masterAddr, "master")
+	startLabeledBackend(t, replicaA, "replica-a")
+	startLabeledBackend(t, replicaB, "replica-b")
+
+	resolver := &stubReplicaResolver{master: masterAddr, replicas: []string{replicaA, replicaB}}
+	replicaListen := fmt.Sprintf("127.0.0.1:%d", replicaListenPort)
+	rsp := newProxyWithResolver(t, replicaProxyPort, &config.Config{ReplicaListen: ptr(replicaListen)}, resolver)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go rsp.Run(ctx)
+	waitForListener(t, fmt.Sprintf("127.0.0.1:%d", replicaProxyPort))
+	waitForListener(t, replicaListen)
+
+	// The master endpoint is unaffected by the replica endpoint.
+	if got := readLabel(t, fmt.Sprintf("127.0.0.1:%d", replicaProxyPort)); got != "master" {
+		t.Errorf("master endpoint reached %q, want master", got)
+	}
+
+	// The replica endpoint rotates through the replicas per connection. The
+	// starting offset is unknown (waitForListener consumed one pick), so two
+	// consecutive connections must reach the two distinct replicas.
+	got := []string{readLabel(t, replicaListen), readLabel(t, replicaListen)}
+	slices.Sort(got)
+	if !slices.Equal(got, []string{"replica-a", "replica-b"}) {
+		t.Errorf("replica endpoint reached %v, want both replicas", got)
+	}
+}
+
+func TestReplicaEndpointFallsBackToMaster(t *testing.T) {
+	masterAddr := fmt.Sprintf("127.0.0.1:%d", fallbackProxyPort+100)
+	startLabeledBackend(t, masterAddr, "master")
+
+	resolver := &stubReplicaResolver{master: masterAddr} // no replicas
+	replicaListen := fmt.Sprintf("127.0.0.1:%d", fallbackListenPort)
+	rsp := newProxyWithResolver(t, fallbackProxyPort, &config.Config{ReplicaListen: ptr(replicaListen)}, resolver)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go rsp.Run(ctx)
+	waitForListener(t, replicaListen)
+
+	if got := readLabel(t, replicaListen); got != "master" {
+		t.Errorf("replica endpoint reached %q, want master (fallback)", got)
+	}
+}
+
+func TestReplicaEndpointRejects(t *testing.T) {
+	masterAddr := fmt.Sprintf("127.0.0.1:%d", rejectProxyPort+100)
+	startLabeledBackend(t, masterAddr, "master")
+
+	resolver := &stubReplicaResolver{master: masterAddr} // no replicas
+	replicaListen := fmt.Sprintf("127.0.0.1:%d", rejectListenPort)
+	rsp := newProxyWithResolver(t, rejectProxyPort,
+		&config.Config{ReplicaListen: ptr(replicaListen), ReplicaFallback: ptr(config.ReplicaFallbackReject)}, resolver)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go rsp.Run(ctx)
+	waitForListener(t, replicaListen)
+
+	conn, err := net.Dial("tcp", replicaListen)
+	if err != nil {
+		t.Fatalf("could not connect to replica endpoint: %v", err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err != io.EOF {
+		t.Errorf("read error = %v, want io.EOF (connection rejected)", err)
+	}
+}
+
 func TestNewRedisSentinelProxyInvalidListenAddr(t *testing.T) {
 	cfg, err := config.Load(&config.Config{Listen: ptr("not a valid addr")}, "")
 	if err != nil {
@@ -544,7 +665,7 @@ func TestDebugLogging(t *testing.T) {
 		out := logBuf.String()
 		if strings.Contains(out, "opened session to master "+backendAddr) &&
 			strings.Contains(out, "closed session to master "+backendAddr) &&
-			strings.Contains(out, "client->master 24 bytes, master->client 24 bytes") {
+			strings.Contains(out, "client->backend 24 bytes, backend->client 24 bytes") {
 			return
 		}
 		if time.Now().After(deadline) {

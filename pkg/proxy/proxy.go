@@ -22,6 +22,12 @@ type masterResolver interface {
 	MasterAddress() string
 }
 
+// replicaResolver is the additional capability the resolver must provide
+// when the replica endpoint is enabled.
+type replicaResolver interface {
+	ReplicaAddress() (addr string, ok bool)
+}
+
 // handshakeTimeout bounds the client's TLS handshake so a client that
 // connects and stalls cannot hold a goroutine indefinitely.
 const handshakeTimeout = 10 * time.Second
@@ -31,9 +37,14 @@ type RedisSentinelProxy struct {
 	tlsConf        *tls.Config
 	masterTLSConf  *tls.Config
 	idleTimeout    time.Duration
-	sem            chan struct{} // connection-limit semaphore; nil = unlimited
+	sem            chan struct{} // connection-limit semaphore; nil = unlimited, shared by both listeners
 	debug          bool
 	masterResolver masterResolver
+
+	// Replica endpoint; replicaAddr == nil means disabled.
+	replicaAddr           *net.TCPAddr
+	replicaResolver       replicaResolver
+	replicaFallbackMaster bool
 }
 
 func NewRedisSentinelProxy(cfg *config.Config, mResolver masterResolver) (*RedisSentinelProxy, error) {
@@ -47,7 +58,7 @@ func NewRedisSentinelProxy(cfg *config.Config, mResolver masterResolver) (*Redis
 		sem = make(chan struct{}, *cfg.MaxConnections)
 	}
 
-	return &RedisSentinelProxy{
+	p := &RedisSentinelProxy{
 		localAddr:      tcpAddr,
 		tlsConf:        cfg.ListenTLSConfig(),
 		masterTLSConf:  cfg.MasterTLSConfig(),
@@ -55,7 +66,40 @@ func NewRedisSentinelProxy(cfg *config.Config, mResolver masterResolver) (*Redis
 		sem:            sem,
 		debug:          *cfg.Debug,
 		masterResolver: mResolver,
-	}, nil
+	}
+
+	if *cfg.ReplicaListen != "" {
+		p.replicaAddr, err = net.ResolveTCPAddr("tcp", *cfg.ReplicaListen)
+		if err != nil {
+			return nil, fmt.Errorf("failed resolving replica listen address: %w", err)
+		}
+		rResolver, ok := mResolver.(replicaResolver)
+		if !ok {
+			return nil, fmt.Errorf("resolver does not support replica tracking")
+		}
+		p.replicaResolver = rResolver
+		p.replicaFallbackMaster = *cfg.ReplicaFallback == config.ReplicaFallbackMaster
+	}
+
+	return p, nil
+}
+
+// pickBackend returns the address a new client connection should be proxied
+// to, together with a label for logging ("master" or "replica").
+type pickBackend func() (addr string, label string, err error)
+
+func (r *RedisSentinelProxy) pickMaster() (string, string, error) {
+	return r.masterResolver.MasterAddress(), "master", nil
+}
+
+func (r *RedisSentinelProxy) pickReplica() (string, string, error) {
+	if addr, ok := r.replicaResolver.ReplicaAddress(); ok {
+		return addr, "replica", nil
+	}
+	if r.replicaFallbackMaster {
+		return r.masterResolver.MasterAddress(), "master (replica fallback)", nil
+	}
+	return "", "", fmt.Errorf("no healthy replica available")
 }
 
 func (r *RedisSentinelProxy) Run(bigCtx context.Context) error {
@@ -69,13 +113,27 @@ func (r *RedisSentinelProxy) Run(bigCtx context.Context) error {
 	}
 
 	errGr, ctx := errgroup.WithContext(bigCtx)
-	errGr.Go(func() error { return r.runListenLoop(ctx, listener) })
+	errGr.Go(func() error { return r.runListenLoop(ctx, listener, r.pickMaster) })
 	errGr.Go(func() error { return closeListenerByContext(ctx, listener) })
+
+	if r.replicaAddr != nil {
+		var replicaListener net.Listener
+		replicaListener, err := net.ListenTCP("tcp", r.replicaAddr)
+		if err != nil {
+			listener.Close()
+			return err
+		}
+		if r.tlsConf != nil {
+			replicaListener = tls.NewListener(replicaListener, r.tlsConf)
+		}
+		errGr.Go(func() error { return r.runListenLoop(ctx, replicaListener, r.pickReplica) })
+		errGr.Go(func() error { return closeListenerByContext(ctx, replicaListener) })
+	}
 
 	return errGr.Wait()
 }
 
-func (r *RedisSentinelProxy) runListenLoop(ctx context.Context, listener net.Listener) error {
+func (r *RedisSentinelProxy) runListenLoop(ctx context.Context, listener net.Listener, pick pickBackend) error {
 	log.Println("Waiting for connections...")
 	for {
 		if err := ctx.Err(); err != nil {
@@ -109,18 +167,18 @@ func (r *RedisSentinelProxy) runListenLoop(ctx context.Context, listener net.Lis
 					<-r.sem
 				}
 			}()
-			r.proxy(conn)
+			r.proxy(conn, pick)
 		}()
 	}
 }
 
-func (r *RedisSentinelProxy) proxy(incoming net.Conn) {
+func (r *RedisSentinelProxy) proxy(incoming net.Conn, pick pickBackend) {
 	defer incoming.Close()
 
 	// Complete the client's TLS handshake (including client-certificate
 	// verification when a client CA is configured) before opening a
-	// connection to the master, so unauthenticated clients cannot exhaust
-	// the master's connection limit.
+	// connection to the backend, so unauthenticated clients cannot exhaust
+	// the backend's connection limit.
 	if tlsConn, ok := incoming.(*tls.Conn); ok {
 		ctx, cancel := context.WithTimeout(context.Background(), handshakeTimeout)
 		err := tlsConn.HandshakeContext(ctx)
@@ -131,17 +189,21 @@ func (r *RedisSentinelProxy) proxy(incoming net.Conn) {
 		}
 	}
 
-	masterAddr := r.masterResolver.MasterAddress()
-	remote, err := r.dialRedis(masterAddr)
+	backendAddr, label, err := pick()
 	if err != nil {
-		log.Printf("Error connecting to master: %s", err)
+		log.Printf("Rejecting connection from %s: %s", incoming.RemoteAddr(), err)
+		return
+	}
+	remote, err := r.dialRedis(backendAddr)
+	if err != nil {
+		log.Printf("Error connecting to %s: %s", label, err)
 		return
 	}
 	defer remote.Close()
 
 	start := time.Now()
 	if r.debug {
-		log.Printf("[debug] %s: opened session to master %s", incoming.RemoteAddr(), masterAddr)
+		log.Printf("[debug] %s: opened session to %s %s", incoming.RemoteAddr(), label, backendAddr)
 	}
 
 	sigChan := make(chan struct{})
@@ -173,8 +235,8 @@ func (r *RedisSentinelProxy) proxy(incoming net.Conn) {
 	<-sigChan
 
 	if r.debug {
-		log.Printf("[debug] %s: closed session to master %s after %s (client->master %d bytes, master->client %d bytes)",
-			incoming.RemoteAddr(), masterAddr, time.Since(start).Round(time.Millisecond), sent, received)
+		log.Printf("[debug] %s: closed session to %s %s after %s (client->backend %d bytes, backend->client %d bytes)",
+			incoming.RemoteAddr(), label, backendAddr, time.Since(start).Round(time.Millisecond), sent, received)
 	}
 }
 

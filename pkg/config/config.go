@@ -13,19 +13,28 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Replica-fallback modes: what the replica listener does with a new client
+// connection while no healthy replica is known.
+const (
+	ReplicaFallbackMaster = "master"
+	ReplicaFallbackReject = "reject"
+)
+
 type Config struct {
-	Listen         *string     `yaml:"listen,omitempty"`
-	Sentinel       *string     `yaml:"sentinel,omitempty"`
-	Master         *string     `yaml:"master_group,omitempty"`
-	Password       *string     `yaml:"password,omitempty"`
-	MasterPassword *string     `yaml:"master_password,omitempty"`
-	ResolveRetries *int        `yaml:"resolve_retries,omitempty"`
-	MaxConnections *int        `yaml:"max_connections,omitempty"`
-	IdleTimeout    *Duration   `yaml:"idle_timeout,omitempty"`
-	Debug          *bool       `yaml:"debug,omitempty"`
-	SentinelTLS    *BackendTLS `yaml:"sentinel_tls,omitempty"`
-	ListenTLS      *ListenTLS  `yaml:"listen_tls,omitempty"`
-	MasterTLS      *BackendTLS `yaml:"master_tls,omitempty"`
+	Listen          *string     `yaml:"listen,omitempty"`
+	ReplicaListen   *string     `yaml:"replica_listen,omitempty"`
+	ReplicaFallback *string     `yaml:"replica_fallback,omitempty"`
+	Sentinel        *string     `yaml:"sentinel,omitempty"`
+	Master          *string     `yaml:"master_group,omitempty"`
+	Password        *string     `yaml:"password,omitempty"`
+	MasterPassword  *string     `yaml:"master_password,omitempty"`
+	ResolveRetries  *int        `yaml:"resolve_retries,omitempty"`
+	MaxConnections  *int        `yaml:"max_connections,omitempty"`
+	IdleTimeout     *Duration   `yaml:"idle_timeout,omitempty"`
+	Debug           *bool       `yaml:"debug,omitempty"`
+	SentinelTLS     *BackendTLS `yaml:"sentinel_tls,omitempty"`
+	ListenTLS       *ListenTLS  `yaml:"listen_tls,omitempty"`
+	MasterTLS       *BackendTLS `yaml:"master_tls,omitempty"`
 
 	tls struct {
 		master      *tls.Config
@@ -74,9 +83,11 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 // without nil checks.
 func Default() *Config {
 	return &Config{
-		Listen:   new(":9999"),
-		Sentinel: new(":26379"),
-		Master:   new("mymaster"),
+		Listen:          new(":9999"),
+		ReplicaListen:   new(""),
+		ReplicaFallback: new(ReplicaFallbackMaster),
+		Sentinel:        new(":26379"),
+		Master:          new("mymaster"),
 		//Password:       new(""),
 		ResolveRetries: new(3),
 		MaxConnections: new(100),
@@ -146,6 +157,8 @@ func (c *Config) Merge(other *Config) {
 		return
 	}
 	fill(&c.Listen, other.Listen)
+	fill(&c.ReplicaListen, other.ReplicaListen)
+	fill(&c.ReplicaFallback, other.ReplicaFallback)
 	fill(&c.Sentinel, other.Sentinel)
 	fill(&c.Master, other.Master)
 	fill(&c.Password, other.Password)
@@ -233,6 +246,11 @@ func Load(flagCfg *Config, path string) (*Config, error) {
 	}
 
 	cfg.Merge(Default())
+
+	if *cfg.ReplicaFallback != ReplicaFallbackMaster && *cfg.ReplicaFallback != ReplicaFallbackReject {
+		return nil, fmt.Errorf("invalid replica_fallback %q (must be %q or %q)",
+			*cfg.ReplicaFallback, ReplicaFallbackMaster, ReplicaFallbackReject)
+	}
 
 	cfg.tls.sentinel, err = cfg.sentinelTLSConfig()
 	if err != nil {

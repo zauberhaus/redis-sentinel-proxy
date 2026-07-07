@@ -17,6 +17,8 @@ func FromEnv() (*Config, error) {
 	}
 
 	strEnv(&c.Listen, "RSP_LISTEN")
+	strEnv(&c.ReplicaListen, "RSP_REPLICA_LISTEN")
+	strEnv(&c.ReplicaFallback, "RSP_REPLICA_FALLBACK")
 	strEnv(&c.Sentinel, "RSP_SENTINEL")
 	strEnv(&c.Master, "RSP_MASTER")
 	strEnv(&c.Password, "SENTINEL_PASSWORD")
