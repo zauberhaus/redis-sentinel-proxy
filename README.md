@@ -89,7 +89,7 @@ YAML file passed with `-config FILE`. Precedence:
 | `-resolve-retries` | `RSP_RESOLVE_RETRIES` | `resolve_retries` | `3` | Consecutive failures of the master resolve to tolerate before the proxy exits, with a progressive backoff between attempts (1s doubling up to 30s); the last known master keeps being served in the meantime |
 | `-max-connections` | `RSP_MAX_CONNECTIONS` | `max_connections` | `100` | Cap on concurrently proxied client connections (0 = unlimited) |
 | `-idle-timeout` | `RSP_IDLE_TIMEOUT` | `idle_timeout` | `30s` | Close a connection after no traffic in either direction for this long (0 = never) |
-| `-debug` | `RSP_DEBUG` | `debug` | `false` | Debug logging: per-connection lifecycle and byte counts (not payloads), plus resolved master/replica addresses and their changes |
+| `-debug` | `RSP_DEBUG` | `debug` | `false` | Debug logging: per-connection lifecycle and byte counts (not payloads), plus master/replica address changes |
 
 Notes:
 

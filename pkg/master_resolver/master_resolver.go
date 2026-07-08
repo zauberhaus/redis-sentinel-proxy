@@ -129,9 +129,10 @@ func (r *RedisMasterResolver) setMasterAddress(masterAddr *net.TCPAddr) {
 	addr := masterAddr.String()
 	r.masterAddrLock.Lock()
 	defer r.masterAddrLock.Unlock()
-	if r.debug {
-		log.Printf("[debug] resolved master %s", addr)
-		if r.masterAddr != "" && r.masterAddr != addr {
+	if r.debug && r.masterAddr != addr {
+		if r.masterAddr == "" {
+			log.Printf("[debug] master %s", addr)
+		} else {
 			log.Printf("[debug] master changed: %s -> %s", r.masterAddr, addr)
 		}
 	}
@@ -155,11 +156,8 @@ func (r *RedisMasterResolver) ReplicaAddress() (addr string, ok bool) {
 func (r *RedisMasterResolver) setReplicaAddresses(replicaAddrs []string) {
 	r.masterAddrLock.Lock()
 	defer r.masterAddrLock.Unlock()
-	if r.debug {
-		log.Printf("[debug] resolved replicas %v", replicaAddrs)
-		if !slices.Equal(r.replicaAddrs, replicaAddrs) {
-			log.Printf("[debug] healthy replicas changed: %v -> %v", r.replicaAddrs, replicaAddrs)
-		}
+	if r.debug && !slices.Equal(r.replicaAddrs, replicaAddrs) {
+		log.Printf("[debug] healthy replicas changed: %v -> %v", r.replicaAddrs, replicaAddrs)
 	}
 	r.replicaAddrs = replicaAddrs
 }
