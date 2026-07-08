@@ -51,6 +51,7 @@ type RedisMasterResolver struct {
 	masterPassword           string
 	retryOnMasterResolveFail int
 	trackReplicas            bool
+	debug                    bool
 
 	masterAddrLock           *sync.RWMutex
 	initialMasterResolveLock chan struct{}
@@ -110,6 +111,7 @@ func NewRedisMasterResolver(cfg *config.Config) *RedisMasterResolver {
 		masterPassword:           masterPassword,
 		retryOnMasterResolveFail: *cfg.ResolveRetries,
 		trackReplicas:            cfg.ReplicaListen != nil && *cfg.ReplicaListen != "",
+		debug:                    cfg.Debug != nil && *cfg.Debug,
 		masterAddrLock:           &sync.RWMutex{},
 		initialMasterResolveLock: make(chan struct{}),
 	}
@@ -124,9 +126,16 @@ func (r *RedisMasterResolver) MasterAddress() string {
 }
 
 func (r *RedisMasterResolver) setMasterAddress(masterAddr *net.TCPAddr) {
+	addr := masterAddr.String()
 	r.masterAddrLock.Lock()
 	defer r.masterAddrLock.Unlock()
-	r.masterAddr = masterAddr.String()
+	if r.debug {
+		log.Printf("[debug] resolved master %s", addr)
+		if r.masterAddr != "" && r.masterAddr != addr {
+			log.Printf("[debug] master changed: %s -> %s", r.masterAddr, addr)
+		}
+	}
+	r.masterAddr = addr
 }
 
 // ReplicaAddress returns a healthy replica (round-robin per call); ok is
@@ -146,8 +155,11 @@ func (r *RedisMasterResolver) ReplicaAddress() (addr string, ok bool) {
 func (r *RedisMasterResolver) setReplicaAddresses(replicaAddrs []string) {
 	r.masterAddrLock.Lock()
 	defer r.masterAddrLock.Unlock()
-	if !slices.Equal(r.replicaAddrs, replicaAddrs) {
-		log.Printf("Healthy replicas: %v", replicaAddrs)
+	if r.debug {
+		log.Printf("[debug] resolved replicas %v", replicaAddrs)
+		if !slices.Equal(r.replicaAddrs, replicaAddrs) {
+			log.Printf("[debug] healthy replicas changed: %v -> %v", r.replicaAddrs, replicaAddrs)
+		}
 	}
 	r.replicaAddrs = replicaAddrs
 }
