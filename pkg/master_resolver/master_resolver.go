@@ -61,6 +61,7 @@ type RedisMasterResolver struct {
 
 	masterAddr   string
 	replicaAddrs []string
+	replicaNames []string // announced names for logging, aligned with replicaAddrs
 	replicaIdx   atomic.Uint64
 }
 
@@ -131,9 +132,9 @@ func (r *RedisMasterResolver) setMasterAddress(masterAddr *net.TCPAddr) {
 	defer r.masterAddrLock.Unlock()
 	if r.debug && r.masterAddr != addr {
 		if r.masterAddr == "" {
-			log.Printf("[debug] master %s", addr)
+			log.Printf("[debug] master %s: %s", r.masterName, addr)
 		} else {
-			log.Printf("[debug] master changed: %s -> %s", r.masterAddr, addr)
+			log.Printf("[debug] master %s changed: %s -> %s", r.masterName, r.masterAddr, addr)
 		}
 	}
 	r.masterAddr = addr
@@ -153,13 +154,14 @@ func (r *RedisMasterResolver) ReplicaAddress() (addr string, ok bool) {
 	return r.replicaAddrs[idx], true
 }
 
-func (r *RedisMasterResolver) setReplicaAddresses(replicaAddrs []string) {
+func (r *RedisMasterResolver) setReplicaAddresses(replicaAddrs, replicaNames []string) {
 	r.masterAddrLock.Lock()
 	defer r.masterAddrLock.Unlock()
 	if r.debug && !slices.Equal(r.replicaAddrs, replicaAddrs) {
-		log.Printf("[debug] healthy replicas changed: %v -> %v", r.replicaAddrs, replicaAddrs)
+		log.Printf("[debug] healthy replicas of %s changed: %v -> %v", r.masterName, r.replicaNames, replicaNames)
 	}
 	r.replicaAddrs = replicaAddrs
+	r.replicaNames = replicaNames
 }
 
 // RefreshAddresses forces an immediate re-resolve of the master and replica
@@ -193,12 +195,12 @@ func (r *RedisMasterResolver) updateMasterAddress(ctx context.Context) error {
 	// Replica tracking is best-effort: a failure must not invalidate the
 	// freshly resolved master.
 	if r.trackReplicas {
-		replicaAddrs, err := r.resolveReplicaAddresses(ctx)
+		replicaAddrs, replicaNames, err := r.resolveReplicaAddresses(ctx)
 		if err != nil {
 			log.Printf("error resolving replicas: %s", err)
-			replicaAddrs = nil
+			replicaAddrs, replicaNames = nil, nil
 		}
-		r.setReplicaAddresses(replicaAddrs)
+		r.setReplicaAddresses(replicaAddrs, replicaNames)
 	}
 	return nil
 }
@@ -306,13 +308,15 @@ func (r *RedisMasterResolver) resolveMasterAddress(ctx context.Context) (*net.TC
 // resolveReplicaAddresses returns the usable replicas of the master group:
 // not flagged down or disconnected by sentinel, replication link up, and
 // answering a ROLE probe with "slave". Sorted for snapshot comparison.
-func (r *RedisMasterResolver) resolveReplicaAddresses(ctx context.Context) ([]string, error) {
+// names carries the announced host names for logging, aligned with addrs.
+func (r *RedisMasterResolver) resolveReplicaAddresses(ctx context.Context) (addrs, names []string, err error) {
 	replicas, err := r.sentinel.Replicas(ctx, r.masterName).Result()
 	if err != nil {
-		return nil, fmt.Errorf("error getting replicas from sentinel: %w", err)
+		return nil, nil, fmt.Errorf("error getting replicas from sentinel: %w", err)
 	}
 
-	var addrs []string
+	type replica struct{ addr, name string }
+	var reps []replica
 	for _, fields := range replicas {
 		if flags := fields["flags"]; strings.Contains(flags, "s_down") ||
 			strings.Contains(flags, "o_down") || strings.Contains(flags, "disconnected") {
@@ -329,10 +333,21 @@ func (r *RedisMasterResolver) resolveReplicaAddresses(ctx context.Context) ([]st
 		if err := r.checkRole(ctx, addr, "slave"); err != nil {
 			continue
 		}
-		addrs = append(addrs, addr.String())
+
+		name := addr.String()
+		if host := fields["ip"]; net.ParseIP(host) == nil {
+			// Sentinel announced a hostname; keep it for logging.
+			name = fmt.Sprintf("%s (%s)", net.JoinHostPort(host, fields["port"]), name)
+		}
+		reps = append(reps, replica{addr: addr.String(), name: name})
 	}
-	slices.Sort(addrs)
-	return addrs, nil
+
+	slices.SortFunc(reps, func(a, b replica) int { return strings.Compare(a.addr, b.addr) })
+	for _, rep := range reps {
+		addrs = append(addrs, rep.addr)
+		names = append(names, rep.name)
+	}
+	return addrs, names, nil
 }
 
 // usableTCPAddr validates and resolves a host/port pair reported by
