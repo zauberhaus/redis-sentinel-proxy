@@ -2,9 +2,16 @@
 
 set -eo pipefail
 
-REPO=`git remote get-url origin | sed -E 's#\.git$##' | sed -E 's#.*[:/]([^/]+/[^/]+)$#\1#'`
-PRG=`basename "$REPO"`
-IMAGE="${IMAGE:-$REPO}"
+PROJECT=`git remote get-url origin | sed -E 's#\.git$##' | sed -E 's#.*[:/]([^/]+/[^/]+)$#\1#'`
+PRG=`basename "$PROJECT"`
+IMAGE="${IMAGE:-$PROJECT}"
+REPO="${REPO:-""}"
+
+if [ "$REPO" != "" ] ; then
+    IMAGE="$REPO/$IMAGE"
+fi
+
+
 # Docker images only run linux, so darwin is dropped from build_dist.sh's
 # platform list; mips64le is also dropped since the alpine base image (used
 # by Dockerfile.prod) has no linux/mips64le variant.
