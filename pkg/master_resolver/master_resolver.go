@@ -51,7 +51,6 @@ type RedisMasterResolver struct {
 	masterPassword           string
 	retryOnMasterResolveFail int
 	trackReplicas            bool
-	debug                    bool
 
 	masterAddrLock           *sync.RWMutex
 	initialMasterResolveLock chan struct{}
@@ -59,10 +58,27 @@ type RedisMasterResolver struct {
 	refreshLock sync.Mutex // serializes RefreshAddresses
 	lastRefresh time.Time  // guarded by refreshLock
 
-	masterAddr   string
-	replicaAddrs []string
-	replicaNames []string // announced names for logging, aligned with replicaAddrs
-	replicaIdx   atomic.Uint64
+	masterAddr    string
+	masterDisplay string   // node name for logging
+	replicaAddrs  []string
+	replicaNames  []string // node names for logging, aligned with replicaAddrs
+	replicaIdx    atomic.Uint64
+
+	ptrCache *ptrCache
+}
+
+// displayName returns a log-friendly node name: "host:port (ip)" when a host
+// name is known (announced by sentinel, or found via reverse DNS), otherwise
+// the plain resolved address.
+func (r *RedisMasterResolver) displayName(ctx context.Context, host, port string, addr *net.TCPAddr) string {
+	name := host
+	if net.ParseIP(host) != nil {
+		name = r.ptrCache.Lookup(ctx, addr.IP.String())
+	}
+	if name == "" {
+		return addr.String()
+	}
+	return fmt.Sprintf("%s (%s)", net.JoinHostPort(name, port), addr.IP)
 }
 
 // clientOptions builds the go-redis options shared by the sentinel client and
@@ -112,9 +128,9 @@ func NewRedisMasterResolver(cfg *config.Config) *RedisMasterResolver {
 		masterPassword:           masterPassword,
 		retryOnMasterResolveFail: *cfg.ResolveRetries,
 		trackReplicas:            cfg.ReplicaListen != nil && *cfg.ReplicaListen != "",
-		debug:                    cfg.Debug != nil && *cfg.Debug,
 		masterAddrLock:           &sync.RWMutex{},
 		initialMasterResolveLock: make(chan struct{}),
+		ptrCache:                 newPTRCache(),
 	}
 }
 
@@ -126,18 +142,19 @@ func (r *RedisMasterResolver) MasterAddress() string {
 	return r.masterAddr
 }
 
-func (r *RedisMasterResolver) setMasterAddress(masterAddr *net.TCPAddr) {
+func (r *RedisMasterResolver) setMasterAddress(masterAddr *net.TCPAddr, name string) {
 	addr := masterAddr.String()
 	r.masterAddrLock.Lock()
 	defer r.masterAddrLock.Unlock()
-	if r.debug && r.masterAddr != addr {
+	if r.masterAddr != addr {
 		if r.masterAddr == "" {
-			log.Printf("[debug] master %s: %s", r.masterName, addr)
+			log.Printf("Master %s: %s", r.masterName, name)
 		} else {
-			log.Printf("[debug] master %s changed: %s -> %s", r.masterName, r.masterAddr, addr)
+			log.Printf("Master %s changed: %s -> %s", r.masterName, r.masterDisplay, name)
 		}
 	}
 	r.masterAddr = addr
+	r.masterDisplay = name
 }
 
 // ReplicaAddress returns a healthy replica (round-robin per call); ok is
@@ -157,8 +174,8 @@ func (r *RedisMasterResolver) ReplicaAddress() (addr string, ok bool) {
 func (r *RedisMasterResolver) setReplicaAddresses(replicaAddrs, replicaNames []string) {
 	r.masterAddrLock.Lock()
 	defer r.masterAddrLock.Unlock()
-	if r.debug && !slices.Equal(r.replicaAddrs, replicaAddrs) {
-		log.Printf("[debug] healthy replicas of %s changed: %v -> %v", r.masterName, r.replicaNames, replicaNames)
+	if !slices.Equal(r.replicaAddrs, replicaAddrs) {
+		log.Printf("Healthy replicas of %s changed: %v -> %v", r.masterName, r.replicaNames, replicaNames)
 	}
 	r.replicaAddrs = replicaAddrs
 	r.replicaNames = replicaNames
@@ -185,12 +202,12 @@ func (r *RedisMasterResolver) RefreshAddresses(ctx context.Context) {
 }
 
 func (r *RedisMasterResolver) updateMasterAddress(ctx context.Context) error {
-	masterAddr, err := r.resolveMasterAddress(ctx)
+	masterAddr, masterName, err := r.resolveMasterAddress(ctx)
 	if err != nil {
 		log.Println(err)
 		return err
 	}
-	r.setMasterAddress(masterAddr)
+	r.setMasterAddress(masterAddr, masterName)
 
 	// Replica tracking is best-effort: a failure must not invalidate the
 	// freshly resolved master.
@@ -279,30 +296,30 @@ func (r *RedisMasterResolver) initialMasterAddressResolve(ctx context.Context) e
 	return err
 }
 
-func (r *RedisMasterResolver) resolveMasterAddress(ctx context.Context) (*net.TCPAddr, error) {
+func (r *RedisMasterResolver) resolveMasterAddress(ctx context.Context) (*net.TCPAddr, string, error) {
 	reply, err := r.sentinel.GetMasterAddrByName(ctx, r.masterName).Result()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
-			return nil, fmt.Errorf("sentinel returned nil reply (unknown master name?)")
+			return nil, "", fmt.Errorf("sentinel returned nil reply (unknown master name?)")
 		}
-		return nil, fmt.Errorf("error getting master address from sentinel: %w", err)
+		return nil, "", fmt.Errorf("error getting master address from sentinel: %w", err)
 	}
 	if len(reply) != 2 {
-		return nil, fmt.Errorf("expected 2 elements from sentinel, got %d", len(reply))
+		return nil, "", fmt.Errorf("expected 2 elements from sentinel, got %d", len(reply))
 	}
 
 	addr, err := usableTCPAddr(reply[0], reply[1])
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	// Sentinel's view can be briefly stale during a failover; confirm the
 	// node is actually a writable master.
 	if err := r.checkRole(ctx, addr, "master"); err != nil {
-		return nil, fmt.Errorf("error checking redis master: %w", err)
+		return nil, "", fmt.Errorf("error checking redis master: %w", err)
 	}
 
-	return addr, nil
+	return addr, r.displayName(ctx, reply[0], reply[1], addr), nil
 }
 
 // resolveReplicaAddresses returns the usable replicas of the master group:
@@ -334,11 +351,7 @@ func (r *RedisMasterResolver) resolveReplicaAddresses(ctx context.Context) (addr
 			continue
 		}
 
-		name := addr.String()
-		if host := fields["ip"]; net.ParseIP(host) == nil {
-			// Sentinel announced a hostname; keep it for logging.
-			name = fmt.Sprintf("%s (%s)", net.JoinHostPort(host, fields["port"]), name)
-		}
+		name := r.displayName(ctx, fields["ip"], fields["port"], addr)
 		reps = append(reps, replica{addr: addr.String(), name: name})
 	}
 
