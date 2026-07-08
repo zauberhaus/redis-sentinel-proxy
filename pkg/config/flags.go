@@ -5,16 +5,13 @@ import (
 	"time"
 )
 
-// BindFlags registers every option as a flag on fs, using the built-in
-// defaults for the help text. The returned function must be called after
-// fs.Parse and yields a Config containing only the flags that were set
-// explicitly on the command line, so it can head a Merge chain where flags
-// take precedence over every other source.
+// BindFlags registers every option as a flag on fs. The returned function
+// must be called after fs.Parse and yields a Config containing only the
+// explicitly set flags, so it can head a Merge chain.
 func BindFlags(fs *flag.FlagSet) func() *Config {
 	def := Default()
 
-	// assign maps a flag name to a closure that copies the parsed value
-	// into a Config; only visited (explicitly set) flags are copied.
+	// Only visited (explicitly set) flags are copied into the Config.
 	assign := map[string]func(*Config){}
 
 	strFlag := func(name, defVal, usage string, set func(*Config, *string)) {

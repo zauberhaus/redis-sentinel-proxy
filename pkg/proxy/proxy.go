@@ -22,38 +22,34 @@ type masterResolver interface {
 	MasterAddress() string
 }
 
-// replicaResolver is the additional capability the resolver must provide
-// when the replica endpoint is enabled.
+// replicaResolver is required of the resolver when the replica endpoint is
+// enabled.
 type replicaResolver interface {
 	ReplicaAddress() (addr string, ok bool)
 }
 
-// addressRefresher is optionally implemented by the resolver. When available,
-// the proxy uses it after a failed backend pick or dial to force an immediate
-// re-resolve of the master and replica addresses and retries once with the
-// fresh state, instead of dropping the client and waiting for the resolver's
-// periodic update loop to notice the failover.
+// addressRefresher is optionally implemented by the resolver; when available
+// the proxy forces a re-resolve after a failed backend connection and
+// retries once.
 type addressRefresher interface {
 	RefreshAddresses(ctx context.Context)
 }
 
-// handshakeTimeout bounds the client's TLS handshake so a client that
-// connects and stalls cannot hold a goroutine indefinitely.
+// handshakeTimeout bounds the client's TLS handshake so a stalled client
+// cannot hold a goroutine indefinitely.
 const handshakeTimeout = 10 * time.Second
 
 type RedisSentinelProxy struct {
-	// Master endpoint; localAddr == nil means disabled (replica-only proxy).
-	localAddr      *net.TCPAddr
+	localAddr      *net.TCPAddr // master endpoint; nil = disabled
 	tlsConf        *tls.Config
 	masterTLSConf  *tls.Config
 	idleTimeout    time.Duration
-	sem            chan struct{} // connection-limit semaphore; nil = unlimited, shared by both listeners
+	sem            chan struct{} // connection limit; nil = unlimited, shared by both listeners
 	debug          bool
 	masterResolver masterResolver
 	refresher      addressRefresher // nil when the resolver can't refresh on demand
 
-	// Replica endpoint; replicaAddr == nil means disabled.
-	replicaAddr           *net.TCPAddr
+	replicaAddr           *net.TCPAddr // replica endpoint; nil = disabled
 	replicaResolver       replicaResolver
 	replicaFallbackMaster bool
 }
@@ -102,8 +98,8 @@ func NewRedisSentinelProxy(cfg *config.Config, mResolver masterResolver) (*Redis
 	return p, nil
 }
 
-// pickBackend returns the address a new client connection should be proxied
-// to, together with a label for logging ("master" or "replica").
+// pickBackend returns the backend address for a new client connection plus a
+// label for logging.
 type pickBackend func() (addr string, label string, err error)
 
 func (r *RedisSentinelProxy) pickMaster() (string, string, error) {
@@ -209,7 +205,6 @@ func (r *RedisSentinelProxy) runListenLoop(ctx context.Context, listener net.Lis
 	}
 }
 
-// pickAndDial picks a backend for the connection and dials it.
 func (r *RedisSentinelProxy) pickAndDial(pick pickBackend) (net.Conn, string, string, error) {
 	addr, label, err := pick()
 	if err != nil {
@@ -223,10 +218,8 @@ func (r *RedisSentinelProxy) pickAndDial(pick pickBackend) (net.Conn, string, st
 }
 
 // connectBackend picks a backend and dials it. When the first attempt fails
-// (a stale master address after a failover, an unreachable replica, or no
-// healthy replica known), it asks the resolver to re-resolve the master and
-// replica addresses right away and retries once with the fresh state before
-// giving up on the client connection.
+// (stale address after a failover, or no healthy replica known), it forces a
+// re-resolve and retries once before giving up on the client connection.
 func (r *RedisSentinelProxy) connectBackend(ctx context.Context, pick pickBackend) (net.Conn, string, string, error) {
 	remote, addr, label, err := r.pickAndDial(pick)
 	if err == nil || r.refresher == nil {
@@ -241,10 +234,8 @@ func (r *RedisSentinelProxy) connectBackend(ctx context.Context, pick pickBacken
 func (r *RedisSentinelProxy) proxy(ctx context.Context, incoming net.Conn, pick pickBackend) {
 	defer incoming.Close()
 
-	// Complete the client's TLS handshake (including client-certificate
-	// verification when a client CA is configured) before opening a
-	// connection to the backend, so unauthenticated clients cannot exhaust
-	// the backend's connection limit.
+	// Complete the client's TLS handshake before dialing the backend, so
+	// unauthenticated clients cannot exhaust the backend's connection limit.
 	if tlsConn, ok := incoming.(*tls.Conn); ok {
 		ctx, cancel := context.WithTimeout(context.Background(), handshakeTimeout)
 		err := tlsConn.HandshakeContext(ctx)
@@ -270,9 +261,8 @@ func (r *RedisSentinelProxy) proxy(ctx context.Context, incoming net.Conn, pick 
 	sigChan := make(chan struct{})
 	defer close(sigChan)
 
-	// Both directions share one activity clock, so a connection only counts
-	// as idle when neither side has sent anything for the whole timeout
-	// (e.g. a pub/sub subscriber that never writes stays alive).
+	// Both directions share one activity clock: a connection is idle only
+	// when neither side sent anything (a pub/sub subscriber stays alive).
 	var in, out io.Reader = incoming, remote
 	if r.idleTimeout > 0 {
 		activity := &atomic.Int64{}
@@ -281,8 +271,8 @@ func (r *RedisSentinelProxy) proxy(ctx context.Context, incoming net.Conn, pick 
 		out = &idleConn{Conn: remote, timeout: r.idleTimeout, activity: activity}
 	}
 
-	// Byte counters are debug-only: the wrapper would otherwise defeat
-	// io.Copy's zero-copy fast path (splice on Linux) on raw TCP connections.
+	// Byte counters only in debug mode: the wrapper defeats io.Copy's
+	// zero-copy fast path (splice on Linux).
 	var sent, received int64
 	if r.debug {
 		in = &countingReader{Reader: in, n: &sent}
@@ -301,10 +291,8 @@ func (r *RedisSentinelProxy) proxy(ctx context.Context, incoming net.Conn, pick 
 	}
 }
 
-// countingReader counts the bytes read through it. The counter is written
-// only by the pipe goroutine owning this direction and read by proxy() after
-// both pipes have signalled completion, so it needs no synchronization of
-// its own.
+// countingReader counts bytes read through it; written only by the owning
+// pipe goroutine and read after both pipes finished, so no synchronization.
 type countingReader struct {
 	io.Reader
 	n *int64
@@ -316,8 +304,8 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// idleConn enforces an idle timeout on Read while sharing the last-activity
-// timestamp with the opposite direction of the same proxied session.
+// idleConn enforces an idle timeout on Read, sharing the last-activity
+// timestamp with the opposite direction of the session.
 type idleConn struct {
 	net.Conn
 	timeout  time.Duration
@@ -333,8 +321,7 @@ func (c *idleConn) Read(p []byte) (int, error) {
 		if n > 0 {
 			c.activity.Store(time.Now().UnixNano())
 		}
-		// On a deadline hit, keep waiting as long as the other direction
-		// has seen traffic within the timeout window.
+		// Keep waiting as long as the other direction saw traffic recently.
 		if errors.Is(err, os.ErrDeadlineExceeded) &&
 			time.Since(time.Unix(0, c.activity.Load())) < c.timeout {
 			continue
@@ -361,11 +348,8 @@ func pipe(w io.WriteCloser, r io.Reader, sigChan chan<- struct{}) {
 
 	_, err := io.Copy(w, r)
 
-	// Half-close so the sibling goroutine copying the other direction can
-	// keep draining instead of racing a fully-closed socket (the source of
-	// "use of closed network connection" log spam on short-lived clients,
-	// e.g. Kubernetes probes). proxy() fully closes both connections once
-	// both directions have finished.
+	// Half-close so the other direction can keep draining instead of racing
+	// a fully-closed socket; proxy() closes both connections at the end.
 	if cw, ok := w.(interface{ CloseWrite() error }); ok {
 		cw.CloseWrite()
 	} else {

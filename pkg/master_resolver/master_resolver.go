@@ -18,23 +18,30 @@ import (
 	"github.com/zauberhaus/redis-sentinel-proxy/pkg/config"
 )
 
-// errSentinelNotReady marks a resolve failure caused by sentinel reporting
-// the 0.0.0.0 (or ::) placeholder it monitors right after startup, before
-// it's reconfigured with the real master. Unlike other failures this always
-// resolves itself once sentinel finishes starting, so the retry loops wait it
-// out (with sentinelNotReadyBackoff between attempts) instead of counting it
-// against the regular retry budget.
+// errSentinelNotReady marks resolve failures that fix themselves — sentinel's
+// 0.0.0.0/:: startup placeholder, or an announced hostname whose DNS record
+// is temporarily gone (restarting Kubernetes pod). The retry loops wait these
+// out instead of counting them against the retry budget.
 var errSentinelNotReady = errors.New("sentinel is not ready yet")
 
-// sentinelNotReadyBackoff is how long to wait between resolve attempts while
-// sentinel is still reporting the startup placeholder (a var so tests can
-// shorten it).
+// Vars (not consts) so tests can shorten them.
 var sentinelNotReadyBackoff = 10 * time.Second
+var refreshThrottle = time.Second // min interval between RefreshAddresses resolves
 
-// refreshThrottle limits how often failed backend connections can force an
-// out-of-band re-resolve via RefreshAddresses; the periodic update loop
-// already re-resolves every second (a var so tests can shorten it).
-var refreshThrottle = time.Second
+// resolveFailureBackoffCap caps the progressive wait between failed resolves.
+const resolveFailureBackoffCap = 30 * time.Second
+
+// ResolveFailureBackoff returns 1s after the first failure, doubled per
+// consecutive failure, capped.
+func ResolveFailureBackoff(errCount int) time.Duration {
+	if errCount < 1 {
+		return time.Second
+	}
+	if errCount > 5 { // 1s << 5 is already past the cap
+		return resolveFailureBackoffCap
+	}
+	return min(time.Second<<(errCount-1), resolveFailureBackoffCap)
+}
 
 type RedisMasterResolver struct {
 	masterName               string
@@ -48,20 +55,17 @@ type RedisMasterResolver struct {
 	masterAddrLock           *sync.RWMutex
 	initialMasterResolveLock chan struct{}
 
-	// refreshLock serializes out-of-band resolves triggered by the proxy via
-	// RefreshAddresses; lastRefresh (guarded by it) throttles them.
-	refreshLock sync.Mutex
-	lastRefresh time.Time
+	refreshLock sync.Mutex // serializes RefreshAddresses
+	lastRefresh time.Time  // guarded by refreshLock
 
 	masterAddr   string
 	replicaAddrs []string
 	replicaIdx   atomic.Uint64
 }
 
-// clientOptions builds the go-redis options shared by the sentinel client
-// and the role probes: short per-operation timeouts (the resolve loop runs
-// every second), no client-side retries (the loops implement their own retry
-// policy), and no CLIENT SETINFO handshake chatter.
+// clientOptions builds the go-redis options shared by the sentinel client and
+// the role probes: 1s per-operation timeouts, no client-side retries (the
+// loops retry themselves), no CLIENT SETINFO chatter.
 func clientOptions(addr string, username, password string, tlsConf *tls.Config) *redis.Options {
 	return &redis.Options{
 		Addr:            addr,
@@ -77,9 +81,6 @@ func clientOptions(addr string, username, password string, tlsConf *tls.Config) 
 	}
 }
 
-// NewRedisMasterResolver creates a resolver that queries the sentinel
-// configured in cfg. The sentinel connection is pooled and reused across
-// resolves; role probes open a short-lived connection to the resolved node.
 func NewRedisMasterResolver(cfg *config.Config) *RedisMasterResolver {
 	var username string
 	if cfg.Username != nil {
@@ -90,10 +91,8 @@ func NewRedisMasterResolver(cfg *config.Config) *RedisMasterResolver {
 		password = *cfg.Password
 	}
 
-	// The master-role probe reuses the sentinel credentials unless dedicated
-	// master ones are configured (an explicitly empty master password
-	// disables AUTH on the probe; an empty username authenticates with the
-	// password alone, i.e. requirepass or the "default" ACL user).
+	// The role probe reuses the sentinel credentials unless dedicated master
+	// ones are configured (explicitly empty password = probe without AUTH).
 	masterUsername := username
 	if cfg.MasterUsername != nil {
 		masterUsername = *cfg.MasterUsername
@@ -130,10 +129,8 @@ func (r *RedisMasterResolver) setMasterAddress(masterAddr *net.TCPAddr) {
 	r.masterAddr = masterAddr.String()
 }
 
-// ReplicaAddress returns the address of a healthy replica, rotating through
-// the known set (round-robin per call). ok is false while no healthy replica
-// is known; the caller decides whether to fall back to the master or reject.
-// Like MasterAddress it blocks until the initial resolve has completed.
+// ReplicaAddress returns a healthy replica (round-robin per call); ok is
+// false while none is known. Blocks until the initial resolve has completed.
 func (r *RedisMasterResolver) ReplicaAddress() (addr string, ok bool) {
 	<-r.initialMasterResolveLock
 
@@ -156,18 +153,14 @@ func (r *RedisMasterResolver) setReplicaAddresses(replicaAddrs []string) {
 }
 
 // RefreshAddresses forces an immediate re-resolve of the master and replica
-// addresses. The proxy calls it after failing to reach a backend, so a
-// failover is picked up right away instead of waiting for the next tick of
-// the update loop. Concurrent calls are serialized and throttled to
-// refreshThrottle, so a burst of failing client connections results in a
-// single resolve; failures are logged by the resolve path and never count
-// against the update loop's retry budget.
+// addresses; the proxy calls it after failing to reach a backend. Calls are
+// serialized and throttled, and failures never count against the update
+// loop's retry budget.
 func (r *RedisMasterResolver) RefreshAddresses(ctx context.Context) {
 	select {
 	case <-r.initialMasterResolveLock:
 	default:
-		// The initial resolve is still running; nothing to refresh yet.
-		return
+		return // initial resolve still running
 	}
 
 	r.refreshLock.Lock()
@@ -188,8 +181,7 @@ func (r *RedisMasterResolver) updateMasterAddress(ctx context.Context) error {
 	r.setMasterAddress(masterAddr)
 
 	// Replica tracking is best-effort: a failure must not invalidate the
-	// successfully resolved master, so it doesn't count against the retry
-	// budget. The replica endpoint handles an empty set via its fallback.
+	// freshly resolved master.
 	if r.trackReplicas {
 		replicaAddrs, err := r.resolveReplicaAddresses(ctx)
 		if err != nil {
@@ -219,31 +211,32 @@ func (r *RedisMasterResolver) UpdateMasterAddressLoop(ctx context.Context) error
 		case <-ticker.C:
 		}
 
+		var wait time.Duration
 		err = r.updateMasterAddress(ctx)
 		switch {
 		case err == nil:
 			errCount = 0
+			continue
 		case errors.Is(err, errSentinelNotReady):
-			// Sentinel is restarting; this fixes itself once it's
-			// reconfigured with the real master, so wait it out instead of
-			// counting it against the retry budget.
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-time.After(sentinelNotReadyBackoff):
-			}
+			// Fixes itself; wait it out without burning the retry budget.
+			wait = sentinelNotReadyBackoff
 		default:
 			errCount++
+			wait = ResolveFailureBackoff(errCount)
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(wait):
 		}
 	}
 	return err
 }
 
-// initialMasterAddressResolve resolves the master address for the first
-// time, retrying up to retryOnMasterResolveFail times (with a 1-second
-// backoff) before giving up. Without this, a single sentinel replica behind
-// a multi-A-record DNS name (e.g. a Kubernetes headless service) that
-// hasn't yet learned about the master would permanently fail startup.
+// initialMasterAddressResolve retries the first resolve up to
+// retryOnMasterResolveFail times so a sentinel behind a multi-A-record DNS
+// name that hasn't yet learned the master doesn't permanently fail startup.
 func (r *RedisMasterResolver) initialMasterAddressResolve(ctx context.Context) error {
 	defer close(r.initialMasterResolveLock)
 
@@ -253,17 +246,16 @@ func (r *RedisMasterResolver) initialMasterAddressResolve(ctx context.Context) e
 			return nil
 		}
 
-		wait := time.Second
+		var wait time.Duration
 		if errors.Is(err, errSentinelNotReady) {
-			// Sentinel is up but still in its startup phase; this always
-			// resolves itself once it's reconfigured with the real master,
-			// so wait longer and don't count it against the retry budget.
+			// Fixes itself; wait it out without burning the retry budget.
 			wait = sentinelNotReadyBackoff
 		} else {
 			errCount++
 			if errCount > r.retryOnMasterResolveFail {
 				break
 			}
+			wait = ResolveFailureBackoff(errCount)
 		}
 
 		select {
@@ -292,9 +284,8 @@ func (r *RedisMasterResolver) resolveMasterAddress(ctx context.Context) (*net.TC
 		return nil, err
 	}
 
-	// Check that the address sentinel gave us is actually a writable master,
-	// not e.g. a demoted former master that's still reachable but now a
-	// replica (sentinel's view can be briefly stale during a failover).
+	// Sentinel's view can be briefly stale during a failover; confirm the
+	// node is actually a writable master.
 	if err := r.checkRole(ctx, addr, "master"); err != nil {
 		return nil, fmt.Errorf("error checking redis master: %w", err)
 	}
@@ -302,12 +293,9 @@ func (r *RedisMasterResolver) resolveMasterAddress(ctx context.Context) (*net.TC
 	return addr, nil
 }
 
-// resolveReplicaAddresses asks sentinel for the replicas of the master group
-// and returns the addresses of those that look usable: not flagged down or
-// disconnected by sentinel, with a working replication link, and actually
-// reporting role "slave" when probed (a replica mid-promotion reports
-// "master" and is skipped - it will be picked up as the master instead).
-// The result is sorted so callers can compare consecutive snapshots.
+// resolveReplicaAddresses returns the usable replicas of the master group:
+// not flagged down or disconnected by sentinel, replication link up, and
+// answering a ROLE probe with "slave". Sorted for snapshot comparison.
 func (r *RedisMasterResolver) resolveReplicaAddresses(ctx context.Context) ([]string, error) {
 	replicas, err := r.sentinel.Replicas(ctx, r.masterName).Result()
 	if err != nil {
@@ -338,16 +326,10 @@ func (r *RedisMasterResolver) resolveReplicaAddresses(ctx context.Context) ([]st
 }
 
 // usableTCPAddr validates and resolves a host/port pair reported by
-// sentinel. Sentinel briefly monitors a placeholder 0.0.0.0 (or ::) right
-// after it restarts, before it's reconfigured with the real master address.
-// Linux treats a connect to 0.0.0.0 as a connect to localhost, so accepting
-// it here would make the role probe "succeed" against the proxy's own
-// listener and send every client into a self-connect loop. Wrapping
-// errSentinelNotReady makes the retry loops wait this phase out with a
-// longer backoff instead of exhausting their retries before sentinel is
-// ready. Sentinel can also be configured to announce a hostname (e.g. a
-// Kubernetes headless-service DNS name) instead of an IP, which is not a
-// placeholder and is fine to resolve normally.
+// sentinel. The 0.0.0.0/:: placeholder sentinel monitors right after a
+// restart must be rejected (as errSentinelNotReady): Linux treats a connect
+// to 0.0.0.0 as localhost, so the role probe would "succeed" against the
+// proxy's own listener and send clients into a self-connect loop.
 func usableTCPAddr(host, port string) (*net.TCPAddr, error) {
 	if host == "" || port == "" {
 		return nil, fmt.Errorf("sentinel returned empty address %q:%q", host, port)
@@ -361,17 +343,21 @@ func usableTCPAddr(host, port string) (*net.TCPAddr, error) {
 
 	addr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(host, port))
 	if err != nil {
+		// A hostname that doesn't resolve right now (restarting pod behind a
+		// headless service) is the DNS flavor of the placeholder: waited out,
+		// not counted against the retry budget.
+		var dnsErr *net.DNSError
+		if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
+			return nil, fmt.Errorf("error resolving redis node: %v: %w", err, errSentinelNotReady)
+		}
 		return nil, fmt.Errorf("error resolving redis node: %w", err)
 	}
 	return addr, nil
 }
 
-// checkRole connects to addr and confirms it currently identifies as
-// wantRole ("master" or "slave") via the ROLE command, rejecting addresses
-// whose actual role no longer matches sentinel's view (which can be briefly
-// stale during a failover). The probe uses the master TLS settings and
-// password - they must match how the proxy itself dials the backend
-// (MasterTLS), otherwise a TLS-enabled backend resets the plaintext probe.
+// checkRole confirms addr currently reports wantRole ("master" or "slave")
+// via the ROLE command. The probe must use the master TLS/credential
+// settings, otherwise a TLS-enabled backend resets the plaintext probe.
 func (r *RedisMasterResolver) checkRole(ctx context.Context, addr *net.TCPAddr, wantRole string) error {
 	client := redis.NewClient(clientOptions(addr.String(), r.masterUsername, r.masterPassword, r.masterTLSConf))
 	defer client.Close()

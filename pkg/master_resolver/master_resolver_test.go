@@ -386,11 +386,8 @@ func TestResolveMasterAddress(t *testing.T) {
 	}
 }
 
-// resolveMaster drives a resolve through the exported API: it starts
-// UpdateMasterAddressLoop in the background (which performs exactly one
-// resolve attempt before returning on failure, or ticking indefinitely on
-// success) and returns whatever MasterAddress() unblocks with once that
-// initial attempt completes.
+// resolveMaster starts UpdateMasterAddressLoop in the background and returns
+// what MasterAddress() unblocks with after the initial resolve.
 func resolveMaster(t *testing.T, addr, tlsMode, masterTLSMode, caFile, username, password string, masterUsername, masterPassword *string, master string) string {
 	t.Helper()
 
@@ -440,10 +437,8 @@ func resolveMaster(t *testing.T, addr, tlsMode, masterTLSMode, caFile, username,
 	}
 }
 
-// TestResolveReplicas exercises replica tracking: the resolver must keep the
-// replicas that sentinel and the role probe agree are healthy, skip the ones
-// flagged down / with a broken link / actually reporting role "master", and
-// rotate through the healthy set on consecutive ReplicaAddress calls.
+// TestResolveReplicas: keep the healthy replicas, skip the down / broken-link
+// / wrong-role ones, and rotate through the healthy set per call.
 func TestResolveReplicas(t *testing.T) {
 	mockServerAddr := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: mockServerPort}
 	listener, err := net.ListenTCP("tcp", mockServerAddr)
@@ -708,11 +703,8 @@ func TestUpdateMasterAddressLoopStopsOnContextCancel(t *testing.T) {
 	}
 }
 
-// TestResolverReflectsMasterChange verifies that a master change reported by
-// sentinel after the proxy has already started (a failover) is picked up:
-// UpdateMasterAddressLoop re-resolves on its 1-second ticker, so
-// MasterAddress() must eventually reflect the new address without needing a
-// restart.
+// TestResolverReflectsMasterChange: a failover reported by sentinel must be
+// picked up by the ticker-driven loop without a restart.
 func TestResolverReflectsMasterChange(t *testing.T) {
 	backendA := startAcceptingListener(t)
 	backendB := startAcceptingListener(t)
@@ -759,10 +751,127 @@ func TestResolverReflectsMasterChange(t *testing.T) {
 	}
 }
 
-// TestRefreshAddresses covers the out-of-band resolve the proxy triggers
-// after a failed backend connection: a refresh picks up a failover
-// immediately (without waiting for the update loop's next tick), while a
-// second refresh within the throttle window is a no-op.
+func TestResolveFailureBackoff(t *testing.T) {
+	for _, tc := range []struct {
+		errCount int
+		want     time.Duration
+	}{
+		{0, time.Second},
+		{1, time.Second},
+		{2, 2 * time.Second},
+		{3, 4 * time.Second},
+		{5, 16 * time.Second},
+		{6, 30 * time.Second},
+		{100, 30 * time.Second},
+	} {
+		if got := masterresolver.ResolveFailureBackoff(tc.errCount); got != tc.want {
+			t.Errorf("ResolveFailureBackoff(%d) = %v, want %v", tc.errCount, got, tc.want)
+		}
+	}
+}
+
+// TestUpdateMasterAddressLoopFailsAfterRetries verifies that persistent
+// resolve failures after a successful start still terminate the loop once
+// the retry budget is spent (with a progressive backoff between attempts).
+func TestUpdateMasterAddressLoopFailsAfterRetries(t *testing.T) {
+	backend := startAcceptingListener(t)
+
+	var currentPort atomic.Int32
+	currentPort.Store(int32(backend.Addr().(*net.TCPAddr).Port))
+
+	sentinelListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("could not start mock sentinel: %v", err)
+	}
+	defer sentinelListener.Close()
+	go serveSwitchableSentinel(sentinelListener, &currentPort)
+
+	r := newResolver(t, sentinelListener.Addr().String(), testMasterName, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.UpdateMasterAddressLoop(ctx) }()
+
+	// Wait for the initial resolve, then break the resolve permanently:
+	// sentinel now reports a master whose ROLE probe fails.
+	r.MasterAddress()
+	currentPort.Store(int32(unusedServerPort)) // nothing listens here
+
+	// retries=1: first failure waits 1s, the second exceeds the budget, so
+	// the loop must return the error (well within the 10s guard).
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("UpdateMasterAddressLoop returned nil, want the resolve error")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("UpdateMasterAddressLoop did not return after the retry budget was spent")
+	}
+}
+
+// TestUpdateMasterAddressLoopSurvivesShortOutage: an outage shorter than the
+// retry budget keeps the loop alive, serving the last known master meanwhile.
+func TestUpdateMasterAddressLoopSurvivesShortOutage(t *testing.T) {
+	backendA := startAcceptingListener(t)
+	backendB := startAcceptingListener(t)
+	portA := backendA.Addr().(*net.TCPAddr).Port
+	portB := backendB.Addr().(*net.TCPAddr).Port
+	deadPort := int32(unusedServerPort) // nothing listens here
+
+	var currentPort atomic.Int32
+	currentPort.Store(int32(portA))
+
+	sentinelListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("could not start mock sentinel: %v", err)
+	}
+	defer sentinelListener.Close()
+	go serveSwitchableSentinel(sentinelListener, &currentPort)
+
+	// retries=3 tolerates an outage of at least 1s+2s+4s of backoff waits.
+	r := newResolver(t, sentinelListener.Addr().String(), testMasterName, 3)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.UpdateMasterAddressLoop(ctx) }()
+
+	wantA := (&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: portA}).String()
+	wantB := (&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: portB}).String()
+	if got := r.MasterAddress(); got != wantA {
+		t.Fatalf("MasterAddress() = %q, want %q", got, wantA)
+	}
+
+	// Break the resolve: sentinel now reports a master whose ROLE probe
+	// fails. A couple of resolves fail during this window, but fewer than
+	// the retry budget allows.
+	currentPort.Store(deadPort)
+	select {
+	case err := <-done:
+		t.Fatalf("UpdateMasterAddressLoop returned (%v) instead of surviving resolve failures", err)
+	case <-time.After(2500 * time.Millisecond):
+	}
+
+	// The last known master is still served while resolves fail.
+	if got := r.MasterAddress(); got != wantA {
+		t.Errorf("MasterAddress() during outage = %q, want last known %q", got, wantA)
+	}
+
+	// Sentinel recovers, now reporting a different master; the loop must
+	// still be alive and pick it up.
+	currentPort.Store(int32(portB))
+	deadline := time.Now().Add(5 * time.Second)
+	for r.MasterAddress() != wantB {
+		if time.Now().After(deadline) {
+			t.Fatalf("MasterAddress() = %q, want %q after recovery", r.MasterAddress(), wantB)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestRefreshAddresses: a refresh picks up a failover synchronously; a second
+// refresh within the throttle window is a no-op.
 func TestRefreshAddresses(t *testing.T) {
 	backendA := startAcceptingListener(t)
 	backendB := startAcceptingListener(t)
@@ -814,18 +923,19 @@ func TestRefreshAddresses(t *testing.T) {
 	}
 }
 
-// TestResolverWaitsForSentinelStartup covers the sentinel startup phase:
-// right after a restart, sentinel monitors a 0.0.0.0 (or ::) placeholder
-// until it's reconfigured with the real master. The resolver must treat this
-// as "sentinel not ready yet" and keep waiting (with a backoff) rather than
-// burning its regular retry budget - here ResolveRetries is 0, so if the
-// placeholder counted as an ordinary failure, the loop would give up before
-// the sentinel becomes ready.
+// TestResolverWaitsForSentinelStartup: the startup placeholder must be waited
+// out instead of burning the retry budget (ResolveRetries is 0 here, so one
+// ordinary failure would already give up).
 func TestResolverWaitsForSentinelStartup(t *testing.T) {
 	restore := masterresolver.SetSentinelNotReadyBackoff(20 * time.Millisecond)
 	defer restore()
 
-	for _, placeholder := range []string{"0.0.0.0", "::"} {
+	// The third "placeholder" is the DNS flavor of the startup phase: sentinel
+	// announces a hostname that doesn't currently resolve (e.g. a Kubernetes
+	// pod behind a headless service that lost its DNS record while
+	// restarting). It must be waited out the same way instead of counting
+	// against the retry budget.
+	for _, placeholder := range []string{"0.0.0.0", "::", "redis-0.does-not-exist.invalid"} {
 		t.Run(placeholder, func(t *testing.T) {
 			backend := startAcceptingListener(t)
 			backendPort := backend.Addr().(*net.TCPAddr).Port
@@ -872,10 +982,9 @@ func isCommand(cmd []string, name string, args int) bool {
 	return len(cmd) == args+1 && strings.EqualFold(cmd[0], name)
 }
 
-// replyUnknownCommand answers an unrecognized command (e.g. the client
-// library's HELLO handshake) with an error reply, so the client falls back
-// to RESP2 and proceeds with the commands the mock actually understands.
-// It reports whether the connection is still usable.
+// replyUnknownCommand answers an unrecognized command (e.g. HELLO) with an
+// error reply so the client falls back to RESP2; reports whether the
+// connection is still usable.
 func replyUnknownCommand(c net.Conn, cmd []string) bool {
 	_, err := fmt.Fprintf(c, "-ERR unknown command %q\r\n", cmd[0])
 	return err == nil
@@ -1097,10 +1206,8 @@ func serveMockSentinelConn(conn net.Conn) {
 	}
 }
 
-// mockReadLine and mockReadBulkString are the mock server's own minimal RESP
-// reader, deliberately independent of the production package's unexported
-// parsing helpers - the mock only needs to understand enough of the
-// request format to find the command boundaries.
+// mockReadLine and mockReadBulkString: the mock server's own minimal RESP
+// reader, deliberately independent of the production parsing helpers.
 func mockReadLine(r *bufio.Reader) (string, error) {
 	line, err := r.ReadString('\n')
 	if err != nil {
@@ -1153,11 +1260,9 @@ func mockReadCommand(r *bufio.Reader) ([]string, error) {
 	return cmd, nil
 }
 
-// buildMockReply maps a parsed command to a raw RESP reply, exercising both
-// the happy path and a range of malformed-reply branches in the production
-// parser purely by choosing specific well-known master names. closeAfter
-// tells the caller to close the connection instead of (or after) writing a
-// reply, simulating the sentinel dropping the connection mid-protocol.
+// buildMockReply maps a command to a raw RESP reply, selecting malformed
+// variants by well-known master name; closeAfter simulates the sentinel
+// dropping the connection mid-protocol.
 func buildMockReply(cmd []string) (reply string, closeAfter bool) {
 	// Redis commands are case-insensitive and go-redis sends them in
 	// lowercase; the well-known master names in the SENTINEL argument stay

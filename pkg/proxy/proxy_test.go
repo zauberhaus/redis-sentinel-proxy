@@ -79,9 +79,7 @@ func (r *atomicResolver) setAddr(addr string) { r.addr.Store(&addr) }
 
 func ptr[T any](v T) *T { return &v }
 
-// refreshingResolver is a masterResolver whose cached address stays stale
-// until RefreshAddresses is called, simulating the on-demand re-resolve the
-// proxy triggers when connecting to the backend fails.
+// refreshingResolver serves a stale address until RefreshAddresses is called.
 type refreshingResolver struct {
 	atomicResolver
 	fresh     string
@@ -147,11 +145,8 @@ func newProxyWithResolver(t *testing.T, port int, flagCfg *config.Config, resolv
 	t.Helper()
 
 	flagCfg.Listen = ptr(fmt.Sprintf("127.0.0.1:%d", port))
-	// Tests that don't care about connection limits or idle timeouts get
-	// them explicitly disabled, rather than depending on whatever
-	// config.Default() happens to ship with; tests that do care about them
-	// (e.g. TestMaxConnections, TestIdleTimeout) already set these fields
-	// themselves, so Merge's fill-only-if-nil semantics leave them alone.
+	// Disable connection limits and idle timeouts unless the test set them
+	// itself, instead of depending on config.Default().
 	if flagCfg.MaxConnections == nil {
 		flagCfg.MaxConnections = ptr(0)
 	}
@@ -422,10 +417,8 @@ func TestIdleTimeout(t *testing.T) {
 	}
 }
 
-// TestProxyFollowsMasterChange verifies the proxy behavior during a sentinel
-// failover: proxy() calls MasterAddress() once per new connection, so a
-// connection already in flight keeps talking to the old master, while any
-// connection accepted after the switch reaches the new one.
+// TestProxyFollowsMasterChange: connections in flight keep talking to the
+// old master; connections accepted after the switch reach the new one.
 func TestProxyFollowsMasterChange(t *testing.T) {
 	addrA := fmt.Sprintf("127.0.0.1:%d", backendAPort)
 	addrB := fmt.Sprintf("127.0.0.1:%d", backendBPort)
@@ -471,11 +464,8 @@ func TestProxyFollowsMasterChange(t *testing.T) {
 	}
 }
 
-// TestRefreshOnDialFailure verifies that when the resolver's cached master no
-// longer accepts connections (e.g. it just failed over), the proxy asks the
-// resolver for an immediate re-resolve and retries once, so the very first
-// client connection after the failover still succeeds instead of being
-// dropped.
+// TestRefreshOnDialFailure: a dial failure against the cached master triggers
+// a refresh and one retry, so the first connection after a failover succeeds.
 func TestRefreshOnDialFailure(t *testing.T) {
 	deadAddr := fmt.Sprintf("127.0.0.1:%d", refreshDeadPort) // nothing listens here
 	liveAddr := fmt.Sprintf("127.0.0.1:%d", refreshBackendPort)
@@ -500,10 +490,8 @@ func TestRefreshOnDialFailure(t *testing.T) {
 	}
 }
 
-// TestRefreshOnMissingReplica verifies the pick-error path of the refresh
-// retry: the replica endpoint (in reject mode) has no healthy replica, the
-// forced re-resolve repopulates the set, and the retried pick reaches the
-// fresh replica instead of the connection being rejected.
+// TestRefreshOnMissingReplica: the pick-error path — no healthy replica in
+// reject mode forces a refresh, and the retried pick reaches the fresh one.
 func TestRefreshOnMissingReplica(t *testing.T) {
 	masterAddr := fmt.Sprintf("127.0.0.1:%d", refreshReplicaProxy+100)
 	replicaAddr := fmt.Sprintf("127.0.0.1:%d", refreshReplicaPort)

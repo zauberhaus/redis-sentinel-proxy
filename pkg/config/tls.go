@@ -101,10 +101,8 @@ func (cs *Config) MasterTLSConfig() *tls.Config {
 	return cs.tls.master
 }
 
-// MasterProbeTLSConfig is the TLS setup for the resolver's master-role probe.
-// It equals MasterTLSConfig when the proxy originates TLS itself, and is
-// non-nil with a nil MasterTLSConfig in passthrough mode (clients do TLS
-// end-to-end, but the probe still has to speak TLS to the master).
+// MasterProbeTLSConfig is the TLS setup for the resolver's role probe; in
+// passthrough mode it is non-nil while MasterTLSConfig is nil.
 func (cs *Config) MasterProbeTLSConfig() *tls.Config {
 	return cs.tls.masterProbe
 }
@@ -119,9 +117,7 @@ func (cs *Config) masterTLSConfig() (probe *tls.Config, dial *tls.Config, err er
 		return nil, nil, errors.New("-master-tls and -master-tls-passthrough are mutually exclusive")
 	}
 
-	// Any option implies enabled: the default is pass-through, and setting
-	// certificate values is the signal to originate TLS towards the master
-	// (or, with -master-tls-passthrough, to use TLS for the role probe only).
+	// Any -master-tls-* option implies enabled.
 	enabled := c != nil && (boolSet(c.Enabled) || strSet(c.CAFile) || strSet(c.CertFile) || strSet(c.KeyFile) || strSet(c.ServerName) || boolSet(c.SkipVerify))
 	if !enabled && !passthrough {
 		return nil, nil, nil

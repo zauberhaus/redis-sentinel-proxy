@@ -13,8 +13,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Replica-fallback modes: what the replica listener does with a new client
-// connection while no healthy replica is known.
+// What the replica listener does while no healthy replica is known.
 const (
 	ReplicaFallbackMaster = "master"
 	ReplicaFallbackReject = "reject"
@@ -63,8 +62,7 @@ type ListenTLS struct {
 	ClientCAFile *string `yaml:"client_ca_file,omitempty"`
 }
 
-// Duration is a time.Duration that unmarshals from YAML strings like "90s"
-// or "5m" (bare integers are nanoseconds, matching time.Duration).
+// Duration unmarshals from YAML strings like "90s" or "5m".
 type Duration time.Duration
 
 func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
@@ -80,9 +78,8 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 	return nil
 }
 
-// Default returns the built-in defaults with every field populated, so a
-// Config that ends its merge chain with Default() can be dereferenced
-// without nil checks.
+// Default returns the built-in defaults; a merge chain ending with Default()
+// can be dereferenced without nil checks.
 func Default() *Config {
 	return &Config{
 		Listen:          new(""),
@@ -158,10 +155,8 @@ func (c *Config) String() string {
 	return string(data)
 }
 
-// Merge fills every nil field of c from other, leaving fields already set
-// untouched. Merging sources in sequence therefore implements precedence:
-// earlier sources win over later ones (e.g. flags, then env, then file,
-// then Default).
+// Merge fills every nil field of c from other; merging sources in sequence
+// implements precedence (flags, then env, then file, then Default).
 func (c *Config) Merge(other *Config) {
 	if other == nil {
 		return

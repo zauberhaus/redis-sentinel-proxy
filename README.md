@@ -30,6 +30,11 @@ or access to the pod network.
 - On-demand re-resolve: when connecting to the master or a replica fails, the
   proxy immediately refreshes the addresses via Sentinel and retries once,
   instead of dropping the client until the next periodic resolve
+- Survives master restarts: a disappearing DNS record (a pod behind a
+  headless service that is restarting) or Sentinel's startup placeholder is
+  waited out without limit; other resolve failures retry with a progressive
+  backoff (1s doubling up to 30s) and only terminate the proxy once
+  `-resolve-retries` consecutive attempts have failed
 - Optional read-only endpoint (`-replica-listen`) that spreads client
   connections across all healthy replicas for read scaling
 - Sentinel authentication (`SENTINEL_PASSWORD` / `-password`)
@@ -81,7 +86,7 @@ YAML file passed with `-config FILE`. Precedence:
 | `-password` | `SENTINEL_PASSWORD` | `password` | — | Password for Sentinel; also used for the master-role probe unless `-master-password` is set |
 | `-master-username` | `RSP_MASTER_USERNAME` | `master_username` | — | ACL username for the master-role probe when it differs from Sentinel's (unset = use the Sentinel username) |
 | `-master-password` | `RSP_MASTER_PASSWORD` | `master_password` | — | Password for the master-role probe when the master's password differs from Sentinel's; set explicitly empty to probe without `AUTH` (Sentinel has a password, master doesn't) |
-| `-resolve-retries` | `RSP_RESOLVE_RETRIES` | `resolve_retries` | `3` | Consecutive failures of the master resolve to tolerate (both at startup and in the continuous loop) before the proxy exits |
+| `-resolve-retries` | `RSP_RESOLVE_RETRIES` | `resolve_retries` | `3` | Consecutive failures of the master resolve to tolerate before the proxy exits, with a progressive backoff between attempts (1s doubling up to 30s); the last known master keeps being served in the meantime |
 | `-max-connections` | `RSP_MAX_CONNECTIONS` | `max_connections` | `100` | Cap on concurrently proxied client connections (0 = unlimited) |
 | `-idle-timeout` | `RSP_IDLE_TIMEOUT` | `idle_timeout` | `30s` | Close a connection after no traffic in either direction for this long (0 = never) |
 | `-debug` | `RSP_DEBUG` | `debug` | `false` | Per-connection debug logging (lifecycle and byte counts, not payloads) |
