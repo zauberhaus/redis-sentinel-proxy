@@ -17,6 +17,8 @@ fi
 # by Dockerfile.prod) has no linux/mips64le variant.
 PLATFORM="${PLATFORM:-linux/amd64 linux/arm64 linux/ppc64le linux/riscv64}"
 PUSH="${PUSH:-true}"
+SIGN=${SIGN:-"true"}
+COSIGN_KEY=${COSIGN_KEY:-"./cosign.key"}
 BUILDER="${BUILDER:-$PRG-deploy}"
 
 if [ -z "$VERSION" ] ; then
@@ -28,6 +30,21 @@ fi
 PLATFORM="$PLATFORM" VERSION="$VERSION" ./scripts/build_dist.sh
 
 DOCKER_PLATFORMS=$(echo "$PLATFORM" | tr ' ' ',')
+
+# Ask for the cosign key password up front (skipped if COSIGN_PASSWORD is
+# already set), so the build doesn't stall on a prompt at the end.
+if [[ "${PUSH}" == "true" && "${SIGN}" == "true" ]]; then
+    if [[ -z "${COSIGN_PASSWORD:-}" ]]; then
+        read -r -s -p "Password for ${COSIGN_KEY}: " COSIGN_PASSWORD
+        echo
+        export COSIGN_PASSWORD
+    fi
+    # Verify the password by decrypting the key before the (long) build.
+    if ! cosign public-key --key "${COSIGN_KEY}" >/dev/null 2>&1; then
+        echo "ERROR: cannot decrypt ${COSIGN_KEY} - wrong password?" >&2
+        exit 1
+    fi
+fi
 
 if ! docker buildx inspect "$BUILDER" >/dev/null 2>&1; then
     docker buildx create --name "$BUILDER" --use
@@ -52,3 +69,9 @@ fi
 
 echo "Deploying $IMAGE:$VERSION for $DOCKER_PLATFORMS"
 docker buildx build "${ARGS[@]}" .
+
+if [[ "${PUSH}" == "true" && "${SIGN}" == "true" ]]; then
+    DIGEST=$(docker buildx imagetools inspect "${IMAGE}" --format '{{.Manifest.Digest}}')
+    echo "Signing ${IMAGE}@${DIGEST}"
+    cosign sign --yes --recursive --key "${COSIGN_KEY}" "${IMAGE}@${DIGEST}"
+fi

@@ -53,6 +53,8 @@ func BindFlags(fs *flag.FlagSet) func() *Config {
 		func(c *Config, v *string) { c.MasterUsername = v })
 	strFlag("master-password", "", "password for the master-role probe when it differs from the sentinel password (unset: use the sentinel password; explicitly empty: probe without AUTH)",
 		func(c *Config, v *string) { c.MasterPassword = v })
+	boolFlag("router", *def.Router, "parse the redis protocol on the master endpoint and route each command by type: reads go to a healthy replica, writes and unknown commands to the master",
+		func(c *Config, v *bool) { c.Router = v })
 	intFlag("resolve-retries", *def.ResolveRetries, "number of consecutive retries of the redis master node resolve",
 		func(c *Config, v *int) { c.ResolveRetries = v })
 	intFlag("max-connections", *def.MaxConnections, "maximum number of concurrently proxied client connections (0 = unlimited)",

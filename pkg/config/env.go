@@ -25,6 +25,9 @@ func FromEnv() (*Config, error) {
 	strEnv(&c.Password, "SENTINEL_PASSWORD")
 	strEnv(&c.MasterUsername, "RSP_MASTER_USERNAME")
 	strEnv(&c.MasterPassword, "RSP_MASTER_PASSWORD")
+	if err := boolEnv(&c.Router, "RSP_ROUTER"); err != nil {
+		return nil, err
+	}
 	if err := intEnv(&c.ResolveRetries, "RSP_RESOLVE_RETRIES"); err != nil {
 		return nil, err
 	}

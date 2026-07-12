@@ -6,8 +6,19 @@ ignorePaths:
   - .gitignore
   - "*.yaml"
   - "*.json"
+  # Redis command tables — command names are not English words
+  - pkg/router/**
 words:
   - armv
+  - BITFIELD
+  - GEORADIUS
+  - GETEX
+  - HGETALL
+  - MGET
+  - PSUBSCRIBE
+  - SSUBSCRIBE
+  - XREAD
+  - XREADGROUP
   - armv6
   - binutils
   - buildx

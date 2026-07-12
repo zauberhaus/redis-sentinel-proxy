@@ -29,6 +29,7 @@ type Config struct {
 	Password        *string     `yaml:"password,omitempty"`
 	MasterUsername  *string     `yaml:"master_username,omitempty"`
 	MasterPassword  *string     `yaml:"master_password,omitempty"`
+	Router          *bool       `yaml:"router,omitempty"`
 	ResolveRetries  *int        `yaml:"resolve_retries,omitempty"`
 	MaxConnections  *int        `yaml:"max_connections,omitempty"`
 	IdleTimeout     *Duration   `yaml:"idle_timeout,omitempty"`
@@ -88,6 +89,7 @@ func Default() *Config {
 		Sentinel:        new(":26379"),
 		Master:          new("mymaster"),
 		//Password:       new(""),
+		Router:         new(false),
 		ResolveRetries: new(3),
 		MaxConnections: new(100),
 		IdleTimeout:    new(Duration(30 * time.Second)),
@@ -170,6 +172,7 @@ func (c *Config) Merge(other *Config) {
 	fill(&c.Password, other.Password)
 	fill(&c.MasterUsername, other.MasterUsername)
 	fill(&c.MasterPassword, other.MasterPassword)
+	fill(&c.Router, other.Router)
 	fill(&c.ResolveRetries, other.ResolveRetries)
 	fill(&c.MaxConnections, other.MaxConnections)
 	fill(&c.IdleTimeout, other.IdleTimeout)
@@ -257,6 +260,10 @@ func Load(flagCfg *Config, path string) (*Config, error) {
 	if *cfg.ReplicaFallback != ReplicaFallbackMaster && *cfg.ReplicaFallback != ReplicaFallbackReject {
 		return nil, fmt.Errorf("invalid replica_fallback %q (must be %q or %q)",
 			*cfg.ReplicaFallback, ReplicaFallbackMaster, ReplicaFallbackReject)
+	}
+
+	if *cfg.Router && cfg.MasterTLS != nil && boolSet(cfg.MasterTLS.Passthrough) {
+		return nil, errors.New("router mode needs to read the redis protocol and cannot be combined with master_tls.passthrough")
 	}
 
 	cfg.tls.sentinel, err = cfg.sentinelTLSConfig()

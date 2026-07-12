@@ -96,6 +96,7 @@ func TestFromEnv(t *testing.T) {
 		t.Setenv("SENTINEL_PASSWORD", "env-password")
 		t.Setenv("RSP_MASTER_USERNAME", "env-master-username")
 		t.Setenv("RSP_MASTER_PASSWORD", "env-master-password")
+		t.Setenv("RSP_ROUTER", "true")
 		t.Setenv("RSP_RESOLVE_RETRIES", "5")
 		t.Setenv("RSP_MAX_CONNECTIONS", "100")
 		t.Setenv("RSP_IDLE_TIMEOUT", "90s")
@@ -115,6 +116,7 @@ func TestFromEnv(t *testing.T) {
 		assertStr(t, "password", cfg.Password, "env-password")
 		assertStr(t, "master_username", cfg.MasterUsername, "env-master-username")
 		assertStr(t, "master_password", cfg.MasterPassword, "env-master-password")
+		assertBool(t, "router", cfg.Router, true)
 		if cfg.ResolveRetries == nil || *cfg.ResolveRetries != 5 {
 			t.Errorf("resolve_retries = %v, want 5", cfg.ResolveRetries)
 		}
@@ -163,7 +165,7 @@ func TestBindFlags(t *testing.T) {
 		fs := flag.NewFlagSet("test", flag.ContinueOnError)
 		fromFlags := config.BindFlags(fs)
 
-		if err := fs.Parse([]string{"-listen", "flag-listen", "-master-tls-ca-file", "flag-ca", "-sentinel-tls", "-max-connections", "50", "-idle-timeout", "2m", "-username", "flag-username", "-master-password", "flag-master-password", "-master-username", "flag-master-username"}); err != nil {
+		if err := fs.Parse([]string{"-listen", "flag-listen", "-master-tls-ca-file", "flag-ca", "-sentinel-tls", "-router", "-max-connections", "50", "-idle-timeout", "2m", "-username", "flag-username", "-master-password", "flag-master-password", "-master-username", "flag-master-username"}); err != nil {
 			t.Fatalf("Parse() error = %v", err)
 		}
 		cfg := fromFlags()
@@ -174,6 +176,7 @@ func TestBindFlags(t *testing.T) {
 		assertStr(t, "master_password", cfg.MasterPassword, "flag-master-password")
 		assertStr(t, "master_tls.ca_file", cfg.MasterTLS.CAFile, "flag-ca")
 		assertBool(t, "sentinel_tls.enabled", cfg.SentinelTLS.Enabled, true)
+		assertBool(t, "router", cfg.Router, true)
 		if cfg.MaxConnections == nil || *cfg.MaxConnections != 50 {
 			t.Errorf("max_connections = %v, want 50", cfg.MaxConnections)
 		}
@@ -203,6 +206,16 @@ func TestBindFlags(t *testing.T) {
 
 		if cfg.Listen != nil || cfg.SentinelTLS != nil || cfg.ListenTLS != nil || cfg.MasterTLS != nil {
 			t.Errorf("cfg = %+v, want all fields nil", cfg)
+		}
+	})
+
+	t.Run("router rejects master TLS passthrough", func(t *testing.T) {
+		cfg := &config.Config{
+			Router:    new(true),
+			MasterTLS: &config.BackendTLS{Passthrough: new(true)},
+		}
+		if _, err := config.Load(cfg, ""); err == nil {
+			t.Fatal("expected error for router combined with master TLS passthrough")
 		}
 	})
 

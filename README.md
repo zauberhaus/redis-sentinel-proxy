@@ -37,6 +37,9 @@ or access to the pod network.
   `-resolve-retries` consecutive attempts have failed
 - Optional read-only endpoint (`-replica-listen`) that spreads client
   connections across all healthy replicas for read scaling
+- Optional per-command routing (`-router`): the master endpoint parses the
+  Redis protocol and sends read commands to a replica and everything else to
+  the master, so a single client connection gets read scaling transparently
 - Sentinel authentication (`SENTINEL_PASSWORD` / `-password`)
 - TLS everywhere it matters: towards Sentinel, towards the master (originated
   or end-to-end pass-through), and terminated for clients — each with optional
@@ -54,11 +57,13 @@ Enabling the read-only endpoint (`-replica-listen`) lifts this for reads: it
 load-balances connections across all healthy replicas, giving outside clients
 read scaling without any Sentinel awareness.
 
-The split is per **connection**, not per command: the proxy never inspects
-the proxied traffic, so applications must use two connection pools and keep
-writes on the master endpoint themselves (a write sent to the replica
-endpoint is rejected by Redis with a `READONLY` error). Transparent
-per-command read/write routing on a single endpoint is out of scope.
+By default the split is per **connection**, not per command: the proxy never
+inspects the proxied traffic, so applications must use two connection pools
+and keep writes on the master endpoint themselves (a write sent to the
+replica endpoint is rejected by Redis with a `READONLY` error). Enabling
+`-router` lifts this: the master endpoint then parses the Redis protocol and
+routes each command individually — see
+[Per-command routing](#per-command-routing--router).
 
 ## Quick start
 
@@ -80,6 +85,7 @@ YAML file passed with `-config FILE`. Precedence:
 | `-listen` | `RSP_LISTEN` | `listen` | `:10000` | Local address of the master endpoint (empty with `-replica-listen` set = disabled, replica-only proxy) |
 | `-replica-listen` | `RSP_REPLICA_LISTEN` | `replica_listen` | — | Local address of the read-only endpoint that load-balances across replicas (empty = disabled) |
 | `-replica-fallback` | `RSP_REPLICA_FALLBACK` | `replica_fallback` | `master` | While no healthy replica is known: `master` proxies read connections to the master, `reject` refuses them |
+| `-router` | `RSP_ROUTER` | `router` | `false` | Parse the Redis protocol on the master endpoint and route each command by type: reads go to a healthy replica, writes and unknown commands to the master |
 | `-sentinel` | `RSP_SENTINEL` | `sentinel` | `:26379` | Sentinel address |
 | `-master` | `RSP_MASTER` | `master_group` | `mymaster` | Name of the master group to resolve |
 | `-username` | `SENTINEL_USERNAME` | `username` | — | ACL username for Sentinel; empty means authenticating with the password alone (`requirepass`) |
@@ -121,6 +127,50 @@ as the master endpoint.
 Setting `-replica-listen` while leaving `-listen` unset (or empty) disables
 the master endpoint entirely, turning the proxy into a read-only, replica-only
 endpoint.
+
+### Per-command routing (`-router`)
+
+With `-router` set, the master endpoint stops being a transparent pipe and
+parses the RESP protocol instead. Every client connection gets a connection
+to the current master and — when a healthy replica is known — one to a
+replica (chosen round-robin, discovered via Sentinel like for
+`-replica-listen`). Each command is then routed by its type:
+
+- **Read-only commands** (`GET`, `MGET`, `HGETALL`, `SCAN`, `FT.SEARCH`,
+  `JSON.GET`, `TS.RANGE`, … including the Redis Stack module commands) are
+  served by the replica.
+- **Writes, admin commands, and anything unknown** go to the master — the
+  safe default, so new or unrecognized commands are never sent to a replica.
+- Commands that only *may* write (`SORT`, `GEORADIUS`, `EVAL`, `BITFIELD`,
+  `GETEX`, `XREADGROUP`, …) go to the master; their read-only variants
+  (`SORT_RO`, `EVAL_RO`, `BITFIELD_RO`, …) stay on the replica.
+- **Connection state** (`AUTH`, `HELLO`, `SELECT`, `RESET`, `CLIENT`) is
+  forwarded to both backends so they stay in sync; the client sees the
+  master's reply.
+- **Subscriptions, transactions, and monitoring** (`SUBSCRIBE`, `PSUBSCRIBE`,
+  `SSUBSCRIBE`, `MULTI`, `WATCH`, `MONITOR`, and the unsubscribe commands)
+  pin the connection to the master for its remaining lifetime; from then on
+  it behaves like a plain proxied connection. The same happens for clients
+  using the inline (telnet-style) protocol.
+
+When no healthy replica is known or the replica connection cannot be
+established, the session degrades gracefully: reads are served by the master,
+which is always correct.
+
+Caveats:
+
+- Replicas are eventually consistent — a read routed to a replica may not yet
+  see an immediately preceding write (`WAIT` can be used to bound this).
+- Commands are relayed strictly in order per connection, so a blocking read
+  (e.g. `XREAD BLOCK`) stalls pipelined commands queued behind it.
+- Client-side caching (`CLIENT TRACKING`) is not supported in router mode:
+  invalidation messages are only relayed from the master connection.
+- `-router` requires the plain master endpoint and cannot be combined with
+  `-master-tls-passthrough`, because the proxy must be able to read the
+  protocol (terminating client TLS with `-listen-tls-*` and originating
+  backend TLS with `-master-tls` both work fine).
+- The `-replica-fallback` setting only applies to the `-replica-listen`
+  endpoint; router mode always falls back to the master.
 
 ### TLS to Sentinel
 

@@ -52,6 +52,10 @@ type RedisSentinelProxy struct {
 	replicaAddr           *net.TCPAddr // replica endpoint; nil = disabled
 	replicaResolver       replicaResolver
 	replicaFallbackMaster bool
+
+	// router routes each command on the master endpoint individually: reads
+	// to a replica, writes to the master (see routing.go).
+	router bool
 }
 
 func NewRedisSentinelProxy(cfg *config.Config, mResolver masterResolver) (*RedisSentinelProxy, error) {
@@ -93,6 +97,18 @@ func NewRedisSentinelProxy(cfg *config.Config, mResolver masterResolver) (*Redis
 
 	if p.localAddr == nil && p.replicaAddr == nil {
 		return nil, fmt.Errorf("no endpoint configured: set listen and/or replica_listen")
+	}
+
+	if cfg.Router != nil && *cfg.Router {
+		if p.localAddr == nil {
+			return nil, fmt.Errorf("router mode requires the master endpoint (listen)")
+		}
+		rResolver, ok := mResolver.(replicaResolver)
+		if !ok {
+			return nil, fmt.Errorf("resolver does not support replica tracking")
+		}
+		p.replicaResolver = rResolver
+		p.router = true
 	}
 
 	return p, nil
@@ -142,7 +158,7 @@ func (r *RedisSentinelProxy) Run(ctx context.Context) (err error) {
 
 		listeners = append(listeners, masterListener)
 
-		errGr.Go(func() error { return r.runListenLoop(errCtx, masterListener, r.pickMaster, "master", r.localAddr) })
+		errGr.Go(func() error { return r.runListenLoop(errCtx, masterListener, r.pickMaster, "master", r.localAddr, r.router) })
 		errGr.Go(func() error { return closeListenerByContext(errCtx, masterListener) })
 	}
 
@@ -159,14 +175,14 @@ func (r *RedisSentinelProxy) Run(ctx context.Context) (err error) {
 
 		listeners = append(listeners, replicaListener)
 
-		errGr.Go(func() error { return r.runListenLoop(errCtx, replicaListener, r.pickReplica, "replica", r.replicaAddr) })
+		errGr.Go(func() error { return r.runListenLoop(errCtx, replicaListener, r.pickReplica, "replica", r.replicaAddr, false) })
 		errGr.Go(func() error { return closeListenerByContext(errCtx, replicaListener) })
 	}
 
 	return errGr.Wait()
 }
 
-func (r *RedisSentinelProxy) runListenLoop(ctx context.Context, listener net.Listener, pick pickBackend, title string, addr *net.TCPAddr) error {
+func (r *RedisSentinelProxy) runListenLoop(ctx context.Context, listener net.Listener, pick pickBackend, title string, addr *net.TCPAddr, routed bool) error {
 	log.Printf("Waiting for %s connections on %v ...\n", title, addr)
 	for {
 		if err := ctx.Err(); err != nil {
@@ -200,7 +216,11 @@ func (r *RedisSentinelProxy) runListenLoop(ctx context.Context, listener net.Lis
 					<-r.sem
 				}
 			}()
-			r.proxy(ctx, conn, pick)
+			if routed {
+				r.routedProxy(ctx, conn)
+			} else {
+				r.proxy(ctx, conn, pick)
+			}
 		}()
 	}
 }
@@ -234,16 +254,8 @@ func (r *RedisSentinelProxy) connectBackend(ctx context.Context, pick pickBacken
 func (r *RedisSentinelProxy) proxy(ctx context.Context, incoming net.Conn, pick pickBackend) {
 	defer incoming.Close()
 
-	// Complete the client's TLS handshake before dialing the backend, so
-	// unauthenticated clients cannot exhaust the backend's connection limit.
-	if tlsConn, ok := incoming.(*tls.Conn); ok {
-		ctx, cancel := context.WithTimeout(context.Background(), handshakeTimeout)
-		err := tlsConn.HandshakeContext(ctx)
-		cancel()
-		if err != nil {
-			log.Printf("TLS handshake with %s failed: %s", incoming.RemoteAddr(), err)
-			return
-		}
+	if !completeClientHandshake(incoming) {
+		return
 	}
 
 	remote, backendAddr, label, err := r.connectBackend(ctx, pick)
@@ -328,6 +340,22 @@ func (c *idleConn) Read(p []byte) (int, error) {
 		}
 		return n, err
 	}
+}
+
+// completeClientHandshake completes the client's TLS handshake (when the
+// listener serves TLS) before any backend is dialed, so unauthenticated
+// clients cannot exhaust the backend's connection limit.
+func completeClientHandshake(incoming net.Conn) bool {
+	if tlsConn, ok := incoming.(*tls.Conn); ok {
+		ctx, cancel := context.WithTimeout(context.Background(), handshakeTimeout)
+		err := tlsConn.HandshakeContext(ctx)
+		cancel()
+		if err != nil {
+			log.Printf("TLS handshake with %s failed: %s", incoming.RemoteAddr(), err)
+			return false
+		}
+	}
+	return true
 }
 
 func (r *RedisSentinelProxy) dialRedis(addr string) (net.Conn, error) {
